@@ -1,12 +1,9 @@
 """
-Aethera Cortex v1.0
+Aethera Cortex v2.0 (Neon Edition)
 Plataforma de Memória Soberana & Gestão de Contexto.
-Multi-Tenant | Auth Dinâmica | Persistência Vetorial
+Multi-Tenant | Auth Dinâmica | Postgres + pgvector
 """
 
-import sqlite3
-import faiss
-import numpy as np
 import os
 import time
 import threading
@@ -14,6 +11,10 @@ import uuid
 import secrets
 import requests
 import logging
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from pgvector.psycopg2 import register_vector
+import numpy as np
 from typing import List, Dict, Optional
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, Security, status
 from fastapi.responses import JSONResponse
@@ -22,27 +23,36 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
 # --- CONFIGURAÇÃO ---
-DATA_DIR = os.environ.get("DATA_DIR", "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-DB_PATH = os.path.join(DATA_DIR, "aethera_cortex.db")
-INDEX_PATH = os.path.join(DATA_DIR, "memory.index")
+# A URL deve vir do .env: postgres://user:pass@endpoint.neon.tech/dbname?sslmode=require
+DATABASE_URL = os.environ.get("DATABASE_URL")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 # Configuração de Modelo (Embedding Local)
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Aethera")
 
-app = FastAPI(title="Aethera Cortex API")
+app = FastAPI(title="Aethera Cortex API v2 (Neon)")
 
-# --- SINGLETONS & LOCKS ---
-faiss_lock = threading.Lock()
+# --- SINGLETONS ---
 logger.info(">>> [BOOT] Carregando Modelos Neurais...")
 embed_model = SentenceTransformer(MODEL_NAME)
-dim = embed_model.get_sentence_embedding_dimension()
+dim = embed_model.get_sentence_embedding_dimension() # 384 para MiniLM
+
+# --- CONEXÃO BANCO ---
+def get_db_connection():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL environment variable is not set")
+    
+    # Robustez: Remove prefixo 'psql ' se o usuário copiou o comando inteiro por engano
+    clean_url = DATABASE_URL.strip()
+    if clean_url.startswith("psql "):
+        clean_url = clean_url.replace("psql ", "").strip()
+        
+    conn = psycopg2.connect(clean_url)
+    return conn
 
 # --- MODELOS PYDANTIC ---
 class MemoryUpdate(BaseModel):
@@ -50,279 +60,251 @@ class MemoryUpdate(BaseModel):
 
 class KeyRequest(BaseModel):
     owner_name: str
-    tier: str = "free"  # 'root', 'pro', 'free'
+    tier: str = "free"
 
-# --- CAMADA DE DADOS (SQLITE + FAISS) ---
-
+# --- BOOTSTRAP DO SCHEMA ---
 def init_db():
-    """Inicializa o Schema Multi-Tenant do Aethera Cortex."""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # 1. Tabela de Memórias (Core)
-    c.execute('''CREATE TABLE IF NOT EXISTS memories (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    timestamp REAL,
-                    vector_id INTEGER
-                )''')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_session ON memories(session_id)')
-
-    # 2. Tabela de Autenticação (SaaS)
-    c.execute('''CREATE TABLE IF NOT EXISTS api_keys (
-                    key TEXT PRIMARY KEY,
-                    owner_name TEXT NOT NULL,
-                    is_active BOOLEAN DEFAULT 1,
-                    created_at REAL,
-                    tier TEXT DEFAULT 'free'
-                )''')
-
-    # 3. Bootstrap: Geração da Chave Mestra (Se o banco estiver vazio)
-    c.execute("SELECT count(*) FROM api_keys")
-    if c.fetchone()[0] == 0:
-        root_key = f"sk_aethera_root_{secrets.token_hex(16)}"
-        logger.warning(f"\n{'='*60}")
-        logger.warning(f" AETHERA CORTEX - PRIMEIRA EXECUÇÃO DETECTADA")
-        logger.warning(f" CHAVE MESTRA (ROOT) GERADA: {root_key}")
-        logger.warning(f" SALVE ESTA CHAVE IMEDIATAMENTE. ELA NÃO SERÁ MOSTRADA NOVAMENTE.")
-        logger.warning(f"{'='*60}\n")
+    """Inicializa o Schema no Postgres (Neon)."""
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
         
-        c.execute("INSERT INTO api_keys (key, owner_name, is_active, created_at, tier) VALUES (?, ?, 1, ?, 'root')", 
-                  (root_key, "System Administrator", time.time()))
+        # 1. Habilita Extensão Vetorial
+        c.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        
+        # 2. Tabela de Memórias (Com vetor)
+        # embedding vector(384)
+        c.execute(f'''CREATE TABLE IF NOT EXISTS memories (
+                        id SERIAL PRIMARY KEY,
+                        session_id TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        timestamp REAL,
+                        embedding vector({dim})
+                    )''')
+        # Indexação (IVFFlat ou HNSW - mas HNSW consome mais build time. Vamos de padrão ou sem indice pra start pequeno)
+        # Para Neon Free Tier (pequeno), busca exata é super rápida. Índices só acima de 10k linhas.
+        
+        # 3. Tabela de Autenticação
+        c.execute('''CREATE TABLE IF NOT EXISTS api_keys (
+                        key TEXT PRIMARY KEY,
+                        owner_name TEXT NOT NULL,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at REAL,
+                        tier TEXT DEFAULT 'free'
+                    )''')
+        
         conn.commit()
-    
-    conn.close()
 
-def load_index():
-    if os.path.exists(INDEX_PATH):
-        logger.info(">>> [BOOT] Carregando Índice Vetorial do Disco...")
-        return faiss.read_index(INDEX_PATH)
-    else:
-        logger.info(">>> [BOOT] Criando Novo Índice Vetorial...")
-        return faiss.IndexIDMap(faiss.IndexFlatL2(dim))
+        # 4. Bootstrap Root Key
+        c.execute("SELECT count(*) FROM api_keys")
+        count = c.fetchone()[0]
+        
+        if count == 0:
+            root_key = f"sk_aethera_root_{secrets.token_hex(16)}"
+            logger.warning(f"\n{'='*60}")
+            logger.warning(f" AETHERA CORTEX (NEON) - PRIMEIRA EXECUÇÃO")
+            logger.warning(f" CHAVE MESTRA (ROOT): {root_key}")
+            logger.warning(f" SALVE AGORA. NÃO APARECERÁ NOVAMENTE.")
+            logger.warning(f"{'='*60}\n")
+            
+            c.execute("INSERT INTO api_keys (key, owner_name, is_active, created_at, tier) VALUES (%s, %s, TRUE, %s, 'root')", 
+                      (root_key, "System Administrator", time.time()))
+            conn.commit()
+            
+        c.close()
+        conn.close()
+        logger.info(">>> [BOOT] Postgres conectado e estruturado.")
+        
+    except Exception as e:
+        logger.error(f"FATAL: Falha ao conectar no Neon: {e}")
 
-# Inicialização
+# Call init on module load (or handle via startup event)
 init_db()
-memory_index = load_index()
 
-# --- SEGURANÇA (AUTH DINÂMICA) ---
-
+# --- SEGURANÇA ---
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
-    """Verifica se a chave existe no banco e está ativa."""
     if not api_key:
-        raise HTTPException(status_code=403, detail="Acesso Negado: Header 'x-api-key' ausente.")
+        raise HTTPException(status_code=403, detail="Missing x-api-key header")
         
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT owner_name, tier FROM api_keys WHERE key = ? AND is_active = 1", (api_key,))
+    c.execute("SELECT owner_name, tier FROM api_keys WHERE key = %s AND is_active = TRUE", (api_key,))
     row = c.fetchone()
     conn.close()
     
     if row:
         return {"key": api_key, "owner": row[0], "tier": row[1]}
     
-    # Delay artificial para evitar ataque de força bruta (Timing Attack Mitigation)
-    time.sleep(0.1)
-    raise HTTPException(status_code=403, detail="Aethera Security: Chave inválida ou revogada.")
+    time.sleep(0.1) # Timing mitigation
+    raise HTTPException(status_code=403, detail="Invalid API Key")
 
 # --- CORE LÓGICO ---
 
 def add_memory_trace(session_id: str, role: str, content: str, background_tasks: BackgroundTasks):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO memories (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-              (session_id, role, content, time.time()))
-    row_id = c.lastrowid
-    conn.commit()
-    conn.close()
-
-    def _vectorize_and_persist(text, db_id):
+    def _persist(sid, r, txt):
         try:
-            vector = embed_model.encode([text])[0]
-            vec_np = np.array([vector]).astype('float32')
-            id_np = np.array([db_id]).astype('int64')
-
-            with faiss_lock:
-                memory_index.add_with_ids(vec_np, id_np)
-                faiss.write_index(memory_index, INDEX_PATH)
-                logger.info(f"DEBUG [MEMORY] Trace {db_id} persistido.")
+            # Vetorização
+            vec = embed_model.encode([txt])[0].tolist() # Convert to list for pgvector
+            
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("""INSERT INTO memories (session_id, role, content, timestamp, embedding) 
+                         VALUES (%s, %s, %s, %s, %s)""",
+                      (sid, r, txt, time.time(), vec))
+            conn.commit()
+            conn.close()
+            logger.info(f"DEBUG [MEMORY] Trace persistido no Neon.")
         except Exception as e:
-            logger.error(f"CRITICAL [MEMORY] Falha na vetorização: {e}")
+            logger.error(f"CRITICAL [MEMORY] Falha ao gravar no Postgres: {e}")
 
-    background_tasks.add_task(_vectorize_and_persist, content, row_id)
-    return row_id
+    background_tasks.add_task(_persist, session_id, role, content)
 
 def retrieve_context(session_id: str, query: str, limit_k: int = 5) -> List[Dict]:
     context_items = []
     
-    # 1. Curto Prazo (SQL)
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT role, content FROM memories WHERE session_id = ? ORDER BY id DESC LIMIT 3", (session_id,))
-    recent_rows = c.fetchall()
+    
+    # 1. Curto Prazo (Recente na mesma sessão)
+    c.execute("SELECT role, content FROM memories WHERE session_id = %s ORDER BY id DESC LIMIT 3", (session_id,))
+    recent = c.fetchall()
+    for r in reversed(recent):
+        context_items.append({"source": "short_term", "role": r[0], "content": r[1]})
+        
+    # 2. Longo Prazo (Busca Semântica via pgvector)
+    # Operador <=> é cosine distance (menor é melhor)
+    q_vec = embed_model.encode([query])[0].tolist()
+    
+    # Query Híbrida: Busca vetorial, mas excluindo os muito recentes se necessário
+    # Syntax: embedding <=> '[1,2,3...]'
+    c.execute("""SELECT role, content, (embedding <=> %s::vector) as distance 
+                 FROM memories 
+                 ORDER BY distance ASC 
+                 LIMIT %s""", 
+              (q_vec, limit_k))
+    
+    vectors = c.fetchall()
     conn.close()
     
-    for r in reversed(recent_rows):
-        context_items.append({"source": "short_term", "role": r[0], "content": r[1]})
-
-    # 2. Longo Prazo (FAISS)
-    if memory_index.ntotal > 0:
-        q_vec = embed_model.encode([query])
-        D, I = memory_index.search(q_vec, limit_k)
-        found_ids = [int(i) for i in I[0] if i != -1]
+    for row in vectors:
+        # row: (role, content, distance)
+        context_items.append({"source": "long_term", "role": row[0], "content": row[1]})
         
-        if found_ids:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            placeholders = ','.join('?' * len(found_ids))
-            query_sql = f"SELECT id, role, content FROM memories WHERE id IN ({placeholders})"
-            c.execute(query_sql, found_ids)
-            vector_rows = c.fetchall()
-            conn.close()
-            
-            for row in vector_rows:
-                context_items.append({"source": "long_term", "role": row[1], "content": row[2]})
-
     return context_items
 
 def execute_llm_call(model_name: str, system_context: str, user_query: str):
-    if not OPENAI_API_KEY:
-        return "[ERRO DE CONFIGURAÇÃO] Servidor sem OPENAI_API_KEY."
-
+    if not OPENAI_API_KEY: return "Sem OPENAI_API_KEY configurada."
+    
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": model_name if model_name != "gpt-4" else "gpt-4o", # Fallback inteligente
+        "model": model_name if model_name != "gpt-4" else "gpt-4o",
         "messages": [
-            {"role": "system", "content": f"AETHERA CORTEX SYSTEM.\nCONTEXTO:\n{system_context}\nINSTRUÇÃO: Use o contexto acima como verdade absoluta."},
+            {"role": "system", "content": f"AETHERA CORTEX SYSTEM.\nCTX:\n{system_context}"},
             {"role": "user", "content": user_query}
         ],
         "temperature": 0.7
     }
-
+    
     try:
-        response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=45)
-        response.raise_for_status()
-        return response.json()['choices'][0]['message']['content']
+        r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=45)
+        r.raise_for_status()
+        return r.json()['choices'][0]['message']['content']
     except Exception as e:
-        return f"[AETHERA ERROR] Falha no Provider LLM: {str(e)}"
+        return f"LLM Error: {e}"
 
-# --- ENDPOINTS ADMIN (GESTÃO DE CHAVES) ---
+# --- ENDPOINTS ---
 
 @app.post("/admin/keys/create", tags=["Admin"])
 async def create_api_key(new_key: KeyRequest, user: dict = Security(verify_api_key)):
-    """Gera uma nova API Key (Requer Root)."""
-    if user['tier'] != 'root':
-        raise HTTPException(status_code=403, detail="Apenas Root Admins podem criar chaves.")
+    if user['tier'] != 'root': raise HTTPException(403, "Admin only")
     
-    generated_key = f"sk_aethera_{secrets.token_urlsafe(16)}"
-    conn = sqlite3.connect(DB_PATH)
+    k = f"sk_aethera_{secrets.token_urlsafe(16)}"
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("INSERT INTO api_keys (key, owner_name, created_at, tier) VALUES (?, ?, ?, ?)",
-              (generated_key, new_key.owner_name, time.time(), new_key.tier))
+    c.execute("INSERT INTO api_keys (key, owner_name, created_at, tier) VALUES (%s, %s, %s, %s)",
+              (k, new_key.owner_name, time.time(), new_key.tier))
     conn.commit()
     conn.close()
-    
-    logger.info(f"AUDIT [KEY_CREATED] By: {user['owner']} For: {new_key.owner_name}")
-    return {"status": "created", "key": generated_key, "owner": new_key.owner_name, "tier": new_key.tier}
+    return {"status": "created", "key": k}
 
 @app.post("/admin/keys/revoke", tags=["Admin"])
 async def revoke_api_key(target_key: str, user: dict = Security(verify_api_key)):
-    """Revoga acesso de uma chave imediatamente."""
-    if user['tier'] != 'root':
-        raise HTTPException(status_code=403, detail="Apenas Root Admins podem revogar.")
-        
-    conn = sqlite3.connect(DB_PATH)
+    if user['tier'] != 'root': raise HTTPException(403, "Admin only")
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("UPDATE api_keys SET is_active = 0 WHERE key = ?", (target_key,))
-    if c.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Chave não encontrada.")
+    c.execute("UPDATE api_keys SET is_active = FALSE WHERE key = %s", (target_key,))
     conn.commit()
     conn.close()
-    
     return {"status": "revoked"}
-
-# --- ENDPOINTS PÚBLICOS (PROTEGIDOS) ---
 
 @app.post("/v1/chat/completions", tags=["Core"])
 async def chat_protocol(request: Request, background_tasks: BackgroundTasks, user: dict = Security(verify_api_key)):
-    """Interface Principal de Chat + Memória."""
     body = await request.json()
     messages = body.get("messages", [])
-    session_id = body.get("session_id", "default")
-    model_target = body.get("model", "gpt-3.5-turbo")
+    if not messages: raise HTTPException(400, "Empty messages")
     
-    if not messages:
-        raise HTTPException(status_code=400, detail="No messages")
-
     user_query = messages[-1]['content']
-    logger.info(f"ACCESS [CHAT] User: {user['owner']} | Session: {session_id}")
-
-    # 1. Recuperação
-    context_data = retrieve_context(session_id, user_query)
+    session_id = body.get("session_id", "default")
+    model = body.get("model", "gpt-3.5-turbo")
     
-    # 2. Memory-Only Bypass (Ingestão Gratuita)
-    if model_target == "memory-only":
+    # 1. Retrieve
+    ctx = retrieve_context(session_id, user_query)
+    
+    if model == "memory-only":
         add_memory_trace(session_id, "user", user_query, background_tasks)
-        return JSONResponse({
-            "id": f"mem-{uuid.uuid4()}",
-            "choices": [{"message": {"role": "assistant", "content": "[AETHERA] Memória ingerida com sucesso."}}]
-        })
-
-    # 3. Montagem de Prompt
-    system_instruction = ""
-    for item in context_data:
-        system_instruction += f"- [{item['source'].upper()}]: {item['content']}\n"
+        return JSONResponse({"choices": [{"message": {"role": "assistant", "content": "Memorized."}}]})
+        
+    # 2. Prompt
+    sys_txt = "\n".join([f"-[{i['source']}]: {i['content']}" for i in ctx])
     
-    # 4. Execução
-    ai_response = execute_llm_call(model_target, system_instruction, user_query)
-
-    # 5. Persistência
+    # 3. Exec
+    resp = execute_llm_call(model, sys_txt, user_query)
+    
+    # 4. Save
     add_memory_trace(session_id, "user", user_query, background_tasks)
-    add_memory_trace(session_id, "assistant", ai_response, background_tasks)
+    add_memory_trace(session_id, "assistant", resp, background_tasks)
+    
+    return JSONResponse({"choices": [{"message": {"role": "assistant", "content": resp}}]})
 
-    return JSONResponse({
-        "id": str(uuid.uuid4()),
-        "model": model_target,
-        "choices": [{"message": {"role": "assistant", "content": ai_response}, "finish_reason": "stop"}]
-    })
-
-# --- CRUD DE MEMÓRIAS ---
-
-@app.get("/v1/memories", tags=["Management"])
+# CRUD
+@app.get("/v1/memories")
 async def list_memories(limit: int = 10, offset: int = 0, user: dict = Security(verify_api_key)):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT id, role, content, timestamp, session_id FROM memories ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))
-    rows = [dict(row) for row in c.fetchall()]
+    conn = get_db_connection()
+    curr = conn.cursor(cursor_factory=RealDictCursor)
+    curr.execute("SELECT id, role, content, timestamp, session_id FROM memories ORDER BY id DESC LIMIT %s OFFSET %s", (limit, offset))
+    rows = curr.fetchall() # Returns list of dicts
     conn.close()
     return {"data": rows}
 
-@app.delete("/v1/memories/{memory_id}", tags=["Management"])
+@app.delete("/v1/memories/{memory_id}")
 async def delete_memory(memory_id: int, user: dict = Security(verify_api_key)):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+    c.execute("DELETE FROM memories WHERE id = %s", (memory_id,))
     deleted = c.rowcount
     conn.commit()
     conn.close()
-    if deleted == 0: raise HTTPException(404, "Memory ID not found")
-    return {"status": "deleted", "id": memory_id}
+    if deleted == 0: raise HTTPException(404, "Not found")
+    return {"status": "deleted"}
 
-@app.put("/v1/memories/{memory_id}", tags=["Management"])
+@app.put("/v1/memories/{memory_id}")
 async def update_memory(memory_id: int, update: MemoryUpdate, user: dict = Security(verify_api_key)):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("UPDATE memories SET content = ? WHERE id = ?", (update.content, memory_id))
+    # Update content AND embedding? For now just content. ideally we re-embed.
+    # Let's re-embed for consistency in v2.
+    new_vec = embed_model.encode([update.content])[0].tolist()
+    
+    c.execute("UPDATE memories SET content = %s, embedding = %s WHERE id = %s", 
+              (update.content, new_vec, memory_id))
     updated = c.rowcount
     conn.commit()
     conn.close()
-    if updated == 0: raise HTTPException(404, "Memory ID not found")
-    return {"status": "updated", "id": memory_id}
+    if updated == 0: raise HTTPException(404, "Not found")
+    return {"status": "updated"}
 
 if __name__ == "__main__":
     import uvicorn

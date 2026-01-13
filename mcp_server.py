@@ -20,7 +20,7 @@ import os
 USER_API_KEY = os.environ.get("AETHERA_KEY", os.environ.get("SOVEREIGN_KEY", "sk_aethera_LCPxn6Bl46xPljDyksxQlw"))
 
 mcp = FastMCP("Aethera Cortex")
-brain = SovereignBrain(base_url="http://localhost:8001", api_key=USER_API_KEY)
+brain = SovereignBrain(base_url="http://100.49.87.83:8001", api_key=USER_API_KEY)
 
 @mcp.tool()
 def remember(fact: str, category: str = "general") -> str:

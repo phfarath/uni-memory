@@ -6,15 +6,10 @@ services:
     container_name: sovereign-memory
     ports:
       - "8001:8001"
-    volumes:
-      # Mapeia a pasta local ./data para dentro do container
-      - ./data:/app/data
     env_file:
       - .env
-    environment:
-      - DATA_DIR=/app/data
     restart: unless-stopped
     deploy:
       resources:
         limits:
-          memory: 2G  # Limite de segurança para o modelo de embedding
+          memory: 2G # Limite de segurança para o modelo de embedding
