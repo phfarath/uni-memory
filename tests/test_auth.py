@@ -2,7 +2,7 @@ import requests
 import os
 
 BAD_KEY = "chave-errada-invasor"
-GOOD_KEY = "sk_sov_9988776655_COLDBREAKER_V1"
+GOOD_KEY = "sk_aethera_LCPxn6Bl46xPljDyksxQlw"
 BASE_URL = "http://localhost:8001"
 
 def test_access(key_name, key_value, expected_status):

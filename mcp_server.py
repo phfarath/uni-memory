@@ -12,13 +12,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-memory")
 
 # Inicializa o Servidor MCP
-mcp = FastMCP("Sovereign Memory")
+# (Configuração movida para abaixo)
 
 # Conecta ao Backend (Docker)
-# Certifique-se que o docker-compose up -d está rodando
 import os
-SOVEREIGN_KEY = os.environ.get("SOVEREIGN_KEY", "sk_sov_9988776655_COLDBREAKER_V1")
-brain = SovereignBrain(base_url="http://localhost:8001", api_key=SOVEREIGN_KEY)
+# Prioriza AETHERA_KEY, senão tenta SOVEREIGN_KEY (compatibilidade com .env), senão usa o hardcoded do usuário
+USER_API_KEY = os.environ.get("AETHERA_KEY", os.environ.get("SOVEREIGN_KEY", "sk_aethera_LCPxn6Bl46xPljDyksxQlw"))
+
+mcp = FastMCP("Aethera Cortex")
+brain = SovereignBrain(base_url="http://localhost:8001", api_key=USER_API_KEY)
 
 @mcp.tool()
 def remember(fact: str, category: str = "general") -> str:

@@ -1,8 +1,10 @@
 from client import SovereignBrain
 import time
 
-# Inicializa o cliente apontando para seu Docker
-brain = SovereignBrain(base_url="http://localhost:8001")
+import os
+# Inicializa o cliente apontando para seu Docker com a chave correta
+api_key = os.environ.get("SOVEREIGN_KEY", "sk_aethera_LCPxn6Bl46xPljDyksxQlw")
+brain = SovereignBrain(base_url="http://localhost:8001", api_key=api_key)
 
 # Cria uma sessão única para não misturar com testes anteriores
 session_id = f"agente-007-{int(time.time())}"
