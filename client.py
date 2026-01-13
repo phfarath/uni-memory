@@ -3,14 +3,20 @@ import uuid
 from typing import Optional, Dict, Any
 
 class SovereignBrain:
-    def __init__(self, base_url: str = "http://localhost:8001", default_model: str = "gpt-3.5-turbo"):
+    def __init__(self, base_url: str = "http://localhost:8001", api_key: str = "minha-senha-super-secreta-dev", default_model: str = "gpt-3.5-turbo"):
         self.base_url = base_url.rstrip("/")
         self.default_model = default_model
+        self.headers = {
+            "Content-Type": "application/json",
+            "x-api-key": api_key 
+        }
+
         # Verifica conexão na inicialização
         try:
-            requests.get(f"{self.base_url}/health", timeout=2) # Se tiver endpoint de health (opcional)
+            # Note: health check endpoint might not be auth protected, but let's assume it exists or fail gracefully
+             requests.get(f"{self.base_url}/health", timeout=2)
         except Exception:
-            pass # Ignora silenciosamente ou loga warning
+            pass 
 
     def _send_payload(self, session_id: str, prompt: str, model: str) -> str:
         url = f"{self.base_url}/v1/chat/completions"
@@ -21,10 +27,14 @@ class SovereignBrain:
         }
         
         try:
-            response = requests.post(url, json=payload, timeout=60)
+            response = requests.post(url, json=payload, headers=self.headers, timeout=60)
             response.raise_for_status()
             data = response.json()
             return data['choices'][0]['message']['content']
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 403:
+                return "[ERRO FATAL] Acesso Negado: Chave de API inválida."
+            return f"[ERRO API] Status {e.response.status_code}: {e.response.text}"
         except requests.exceptions.ConnectionError:
             return "[ERRO FATAL] O Cérebro (Docker) está desligado ou inacessível."
         except Exception as e:
@@ -51,7 +61,7 @@ class SovereignBrain:
         """Retorna a lista crua de memórias com seus IDs."""
         try:
             url = f"{self.base_url}/v1/memories?limit={limit}"
-            resp = requests.get(url, timeout=5)
+            resp = requests.get(url, headers=self.headers, timeout=5)
             # The endpoint returns {"data": [...]}, so we access .get("data")
             return resp.json().get("data", [])
         except Exception as e:
@@ -63,7 +73,7 @@ class SovereignBrain:
         """Apaga uma memória específica pelo ID."""
         try:
             url = f"{self.base_url}/v1/memories/{memory_id}"
-            resp = requests.delete(url, timeout=5)
+            resp = requests.delete(url, headers=self.headers, timeout=5)
             if resp.status_code == 200:
                 return f"Memória {memory_id} apagada com sucesso."
             return f"Erro ao apagar: {resp.text}"
@@ -74,7 +84,7 @@ class SovereignBrain:
         """Reescreve uma memória existente."""
         try:
             url = f"{self.base_url}/v1/memories/{memory_id}"
-            resp = requests.put(url, json={"content": new_text}, timeout=5)
+            resp = requests.put(url, json={"content": new_text}, headers=self.headers, timeout=5)
             if resp.status_code == 200:
                 return f"Memória {memory_id} atualizada."
             return f"Erro ao atualizar: {resp.text}"

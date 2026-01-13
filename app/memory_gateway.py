@@ -13,8 +13,10 @@ import uuid
 import requests
 import json
 from typing import List, Dict, Optional
-from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from typing import List, Dict, Optional
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, Security, status
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -33,6 +35,18 @@ DB_PATH = os.path.join(DATA_DIR, "history.db")
 INDEX_PATH = os.path.join(DATA_DIR, "memory.index")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+# --- SECURITY ---
+SOVEREIGN_KEY = os.environ.get("SOVEREIGN_KEY", "minha-senha-super-secreta-dev")
+api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+
+async def get_api_key(api_key_header: str = Security(api_key_header)):
+    if api_key_header == SOVEREIGN_KEY:
+        return api_key_header
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Acesso Negado: Chave Soberana Inválida"
+    )
 
 # Modelo rápido para indexação de memória (não precisa de Cross-Encoder aqui ainda)
 # Usamos o MiniLM para varrer grandes históricos rapidamente.
@@ -199,7 +213,11 @@ def execute_llm_call(model_name: str, system_context: str, user_query: str):
 # --- NOVOS ENDPOINTS DE GESTÃO (CRUD) ---
 
 @app.get("/v1/memories")
-async def list_memories(limit: int = 10, offset: int = 0):
+async def list_memories(
+    limit: int = 10, 
+    offset: int = 0,
+    token: str = Security(get_api_key)
+):
     """Lista memórias cruas para administração (ver IDs)."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -210,7 +228,10 @@ async def list_memories(limit: int = 10, offset: int = 0):
     return {"data": rows}
 
 @app.delete("/v1/memories/{memory_id}")
-async def delete_memory_endpoint(memory_id: int):
+async def delete_memory_endpoint(
+    memory_id: int,
+    token: str = Security(get_api_key)
+):
     """Lobotomia: Remove o registro do SQLite. O vetor no FAISS se torna órfão (invisível)."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -225,7 +246,11 @@ async def delete_memory_endpoint(memory_id: int):
     return {"status": "deleted", "id": memory_id}
 
 @app.put("/v1/memories/{memory_id}")
-async def update_memory_endpoint(memory_id: int, update: MemoryUpdate):
+async def update_memory_endpoint(
+    memory_id: int, 
+    update: MemoryUpdate,
+    token: str = Security(get_api_key)
+):
     """Alteração de Fato. (Nota: O vetor antigo continuará apontando para este ID, mas com texto novo)."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -244,7 +269,11 @@ async def update_memory_endpoint(memory_id: int, update: MemoryUpdate):
 # --- ENDPOINT ATUALIZADO ---
 
 @app.post("/v1/chat/completions")
-async def chat_protocol(request: Request, background_tasks: BackgroundTasks):
+async def chat_protocol(
+    request: Request, 
+    background_tasks: BackgroundTasks,
+    token: str = Security(get_api_key)
+):
     """
     Universal Chat Interface.
     O 'model' no body decide qual LLM usaríamos (aqui simulado).

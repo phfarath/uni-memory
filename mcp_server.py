@@ -16,7 +16,9 @@ mcp = FastMCP("Sovereign Memory")
 
 # Conecta ao Backend (Docker)
 # Certifique-se que o docker-compose up -d está rodando
-brain = SovereignBrain(base_url="http://localhost:8001")
+import os
+SOVEREIGN_KEY = os.environ.get("SOVEREIGN_KEY", "sk_sov_9988776655_COLDBREAKER_V1")
+brain = SovereignBrain(base_url="http://localhost:8001", api_key=SOVEREIGN_KEY)
 
 @mcp.tool()
 def remember(fact: str, category: str = "general") -> str:
