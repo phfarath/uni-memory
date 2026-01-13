@@ -46,3 +46,37 @@ class SovereignBrain:
     def new_session(self) -> str:
         """Gera um ID de sessão único."""
         return str(uuid.uuid4())
+
+    def list_recent(self, limit: int = 10) -> list:
+        """Retorna a lista crua de memórias com seus IDs."""
+        try:
+            url = f"{self.base_url}/v1/memories?limit={limit}"
+            resp = requests.get(url, timeout=5)
+            # The endpoint returns {"data": [...]}, so we access .get("data")
+            return resp.json().get("data", [])
+        except Exception as e:
+            # Returning a list with error string to be compatible with expected list return, 
+            # though caller should handle types. Logic follows user snippet.
+            return [{"error": f"Erro ao listar: {str(e)}"}]
+
+    def forget(self, memory_id: int) -> str:
+        """Apaga uma memória específica pelo ID."""
+        try:
+            url = f"{self.base_url}/v1/memories/{memory_id}"
+            resp = requests.delete(url, timeout=5)
+            if resp.status_code == 200:
+                return f"Memória {memory_id} apagada com sucesso."
+            return f"Erro ao apagar: {resp.text}"
+        except Exception as e:
+            return f"Erro de conexão: {str(e)}"
+
+    def update(self, memory_id: int, new_text: str) -> str:
+        """Reescreve uma memória existente."""
+        try:
+            url = f"{self.base_url}/v1/memories/{memory_id}"
+            resp = requests.put(url, json={"content": new_text}, timeout=5)
+            if resp.status_code == 200:
+                return f"Memória {memory_id} atualizada."
+            return f"Erro ao atualizar: {resp.text}"
+        except Exception as e:
+            return f"Erro de conexão: {str(e)}"

@@ -17,6 +17,10 @@ from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
+from pydantic import BaseModel
+
+class MemoryUpdate(BaseModel):
+    content: str
 
 # Carrega variáveis de ambiente do arquivo .env se existir
 load_dotenv()
@@ -191,6 +195,51 @@ def execute_llm_call(model_name: str, system_context: str, user_query: str):
         return result['choices'][0]['message']['content']
     except Exception as e:
         return f"[ERRO PROVIDER] Falha na chamada ao LLM: {str(e)}"
+
+# --- NOVOS ENDPOINTS DE GESTÃO (CRUD) ---
+
+@app.get("/v1/memories")
+async def list_memories(limit: int = 10, offset: int = 0):
+    """Lista memórias cruas para administração (ver IDs)."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT id, role, content, timestamp, session_id FROM memories ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))
+    rows = [dict(row) for row in c.fetchall()]
+    conn.close()
+    return {"data": rows}
+
+@app.delete("/v1/memories/{memory_id}")
+async def delete_memory_endpoint(memory_id: int):
+    """Lobotomia: Remove o registro do SQLite. O vetor no FAISS se torna órfão (invisível)."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+    deleted = c.rowcount
+    conn.commit()
+    conn.close()
+    
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Memory ID not found")
+    
+    return {"status": "deleted", "id": memory_id}
+
+@app.put("/v1/memories/{memory_id}")
+async def update_memory_endpoint(memory_id: int, update: MemoryUpdate):
+    """Alteração de Fato. (Nota: O vetor antigo continuará apontando para este ID, mas com texto novo)."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # Atualizamos o conteúdo. 
+    # Obs: Idealmente reindexaríamos o vetor, mas para edições pequenas, manter o vetor antigo é aceitável.
+    c.execute("UPDATE memories SET content = ? WHERE id = ?", (update.content, memory_id))
+    updated = c.rowcount
+    conn.commit()
+    conn.close()
+    
+    if updated == 0:
+        raise HTTPException(status_code=404, detail="Memory ID not found")
+        
+    return {"status": "updated", "id": memory_id, "new_content": update.content}
 
 # --- ENDPOINT ATUALIZADO ---
 

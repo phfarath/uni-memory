@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "sovereign-memory": {
+      "command": "/Users/phfarath/Library/Mobile Documents/com~apple~CloudDocs/Pessoal-PF/Codes/uni-memory/venv/bin/python",
+      "args": [
+        "/Users/phfarath/Library/Mobile Documents/com~apple~CloudDocs/Pessoal-PF/Codes/uni-memory/mcp_server.py"
+      ]
+    }
+  }
+}
