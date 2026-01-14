@@ -152,32 +152,43 @@ async def verify_api_key(
 # --- MIDDLEWARE DE PROTEÇÃO DO MCP ---
 class McpAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Se a rota começar com /mcp, exigimos autenticação
-        if request.url.path.startswith("/mcp"):
-            # Extrai a chave da Query String (Header é difícil em SSE)
-            api_key = request.query_params.get("x-api-key")
+        # Protegemos APENAS a porta de entrada (Handshake SSE)
+        # As mensagens subsequentes (/messages) são validadas pelo Session ID do FastMCP
+        if request.url.path.endswith("/sse"):
+            # 1. Pega a chave
+            api_key = request.query_params.get("x-api-key") or request.headers.get("x-api-key")
             
             if not api_key:
-                 # Tenta pegar do header como fallback
-                api_key = request.headers.get("x-api-key")
+                return JSONResponse(status_code=403, content={"detail": "Missing Key in SSE Handshake"})
 
-            if not api_key:
-                return JSONResponse(status_code=403, content={"detail": "MCP Auth Required: Passe ?x-api-key=..."})
-
-            # Validação
+            # 2. Validação (Fail-Safe)
             try:
                 conn = get_db_connection()
                 c = conn.cursor()
                 c.execute("SELECT 1 FROM api_keys WHERE key = %s AND is_active = TRUE", (api_key,))
                 authorized = c.fetchone()
                 conn.close()
+                
                 if not authorized:
-                    return JSONResponse(status_code=403, content={"detail": "MCP Key Invalid"})
+                    return JSONResponse(status_code=403, content={"detail": "Invalid Key"})
+                    
             except Exception as e:
-                return JSONResponse(status_code=500, content={"detail": "Auth DB Error"})
+                logger.error(f"AUTH ERROR: {e}")
+                return JSONResponse(status_code=500, content={"detail": "Auth System Error"})
 
-        response = await call_next(request)
-        return response
+        return await call_next(request)
+
+# --- MIDDLEWARES ---
+from fastapi.middleware.cors import CORSMiddleware
+
+# CORS (Permitir tudo para desenvolvimento local/teste)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.add_middleware(McpAuthMiddleware)
 
@@ -250,11 +261,12 @@ def execute_llm_call(model_name: str, system_context: str, user_query: str):
     except Exception as e:
         return f"LLM Error: {e}"
 
-# --- INTEGRAÇÃO MCP CLOUD (SSE - MANUAL) ---
+# --- INTEGRAÇÃO MCP CLOUD (MANUAL - ANYIO STREAMS) ---
 from mcp.server import Server
-from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent, ImageContent, EmbeddedResource
 from starlette.responses import StreamingResponse
+import asyncio
+import anyio
 
 mcp_server = Server("Aethera Cloud")
 
@@ -295,7 +307,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         category = arguments.get("category", "general")
         try:
             enriched = f"[{category.upper()}] {fact}"
-            # Chamada síncrona wrapper
             add_memory_trace_logic("mcp-sse-session", "user", enriched)
             return [TextContent(type="text", text="Memória salva com sucesso na Nuvem Aethera.")]
         except Exception as e:
@@ -314,30 +325,83 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             
     raise ValueError(f"Ferramenta desconhecida: {name}")
 
-# Armazenamento simples de sessões SSE (Em prod use Redis/Memcached)
-sse_sessions: Dict[str, SseServerTransport] = {}
+# Estrutura para segurar as pontas dos streams
+class SseSession:
+    def __init__(self, post_sink, sse_source):
+        self.post_sink = post_sink   # Onde escrevemos o que vem do POST
+        self.sse_source = sse_source # De onde lemos para mandar pro SSE
+
+# Store sessions
+sse_sessions: Dict[str, SseSession] = {}
 
 @app.get("/mcp/sse")
 async def handle_sse(request: Request):
-    # Cria um novo transporte para esta conexão
-    transport = SseServerTransport("/mcp/messages")
     session_id = str(uuid.uuid4())
+    logger.info(f"DEBUG: Starting SSE Session {session_id}")
+
+    # Cria canais AnyIO
+    # Docs: send_stream, receive_stream = create_memory_object_stream(buffer_size)
     
-    # Armazena transporte
-    sse_sessions[session_id] = transport
+    # Canal 1: Cliente POST (Send) -> Server (Recv)
+    post_send, server_recv = anyio.create_memory_object_stream(10)
     
-    async def event_generator():
-        # 1. Envia URI de endpoint para o cliente
-        yield f"event: endpoint\ndata: /mcp/messages?session={session_id}\n\n"
-        
-        # 2. Conecta e streama mensagens do servidor -> cliente
+    # Canal 2: Server (Send) -> Cliente SSE (Recv)
+    server_send, sse_recv = anyio.create_memory_object_stream(10)
+    
+    # Armazena as pontas 'Client-Side' na sessão
+    # post_sink = onde o endpoint POST escreve (send stream)
+    # sse_source = onde o endpoint GET lê (recv stream)
+    sse_sessions[session_id] = SseSession(post_send, sse_recv)
+    
+    api_key = request.query_params.get("x-api-key")
+    async def run_server_loop():
+        logger.info(f"DEBUG: MCP Server Loop STARTED for {session_id}")
         try:
-            async for message in transport.connect():
-                yield f"event: message\ndata: {message.model_dump_json()}\n\n"
+            # Server.run() espera (read_stream, write_stream, options)
+            options = mcp_server.create_initialization_options()
+            await mcp_server.run(server_recv, server_send, options)
+            logger.info(f"DEBUG: MCP Server Loop ENDED cleanly for {session_id}")
         except Exception as e:
-            logger.error(f"SSE Connection Error: {e}")
+            logger.error(f"MCP Server Loop Error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    asyncio.create_task(run_server_loop())
+
+    async def event_generator():
+        # Constrói a URL ABSOLUTA do endpoint
+        # Forçamos 127.0.0.1 para evitar problemas de DNS (localhost vs ::1)
+        base_url = "http://127.0.0.1:8001"
+        endpoint_url = f"{base_url}/mcp/messages?session={session_id}"
+        
+        # Preserva a chave de API
+        if api_key:
+            endpoint_url += f"&x-api-key={api_key}"
+            
+        logger.info(f"DEBUG: Yielding endpoint: {endpoint_url}")
+        yield f"event: endpoint\ndata: {endpoint_url}\n\n"
+        
+        try:
+            async with sse_sessions[session_id].sse_source:
+                async for message in sse_sessions[session_id].sse_source:
+                    # Message é um objeto JSONRPCMessage, precisamos serializar
+                    # A lib usually returns objects.
+                    # Pydantic v2 dump
+                    if hasattr(message, 'model_dump_json'):
+                        data = message.model_dump_json()
+                    else:
+                        data = str(message)
+                        
+                    logger.info(f"DEBUG: Sending SSE Message to client: {data[:100]}...")
+                    yield f"event: message\ndata: {data}\n\n"
+        except anyio.EndOfStream:
+             logger.info("Stream ended")
+        except asyncio.CancelledError:
+            logger.info("Client disconnected")
+        except Exception as e:
+             logger.error(f"Event Generator Error: {e}")
         finally:
-            # Limpeza
+            logger.info(f"Cleaning up session {session_id}")
             if session_id in sse_sessions:
                 del sse_sessions[session_id]
 
@@ -346,18 +410,32 @@ async def handle_sse(request: Request):
 @app.post("/mcp/messages")
 async def handle_messages(request: Request):
     session_id = request.query_params.get("session")
-    transport = sse_sessions.get(session_id)
+    session = sse_sessions.get(session_id)
     
-    if not transport:
+    logger.info(f"DEBUG: POST /messages received for session {session_id}")
+    
+    if not session:
+        logger.warning(f"DEBUG: Session {session_id} not found in {list(sse_sessions.keys())}")
         return JSONResponse({"error": "Session not found"}, 404)
     
-    # Processa mensagem JSON-RPC recebida
     try:
         body = await request.json()
-        await transport.handle_post_message(mcp_server.create_initialization_options(), body)
+        
+        # Validar e Parsear usando a lib MCP
+        from mcp.types import JSONRPCMessage
+        from pydantic import TypeAdapter
+        adapter = TypeAdapter(JSONRPCMessage)
+        msg_obj = adapter.validate_python(body)
+        
+        # Escreve no sink (post_sink)
+        # É um MemoryObjectSendStream
+        logger.info(f"DEBUG: Sending to server input sink...")
+        await session.post_sink.send(msg_obj)
+        logger.info(f"DEBUG: Sent to server input sink.")
+        
         return JSONResponse({"status": "accepted"})
     except Exception as e:
-        logger.error(f"Message Handling Error: {e}")
+        logger.error(f"Message Post Error: {e}")
         return JSONResponse({"error": str(e)}, 500)
 
 # --- ENDPOINTS REST CLASSICOS ---

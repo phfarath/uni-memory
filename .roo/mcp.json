@@ -5,7 +5,7 @@
       "args": [
         "-y",
         "@modelcontextprotocol/server-sse-client",
-        "http://100.49.87.83:8001/mcp/sse?x-api-key=sk_aethera_kJIhaMXBPt-DaHb9uPjWPQ"
+        "http://127.0.0.1:8001/mcp/sse?x-api-key=sk_aethera_kJIhaMXBPt-DaHb9uPjWPQ"
       ]
     }
   }
