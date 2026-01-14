@@ -1,5 +1,5 @@
-fastapi==0.109.0
-uvicorn==0.27.0
+fastapi>=0.110.0
+uvicorn>=0.30.0
 requests==2.31.0
 sentence-transformers==2.3.1
 numpy<2.0.0
@@ -7,3 +7,4 @@ python-multipart
 psycopg2-binary==2.9.9
 pgvector==0.2.5
 python-dotenv
+mcp==1.2.0

@@ -17,7 +17,7 @@ logger = logging.getLogger("mcp-memory")
 # Conecta ao Backend (Docker)
 import os
 # Prioriza AETHERA_KEY, senão tenta SOVEREIGN_KEY (compatibilidade com .env), senão usa o hardcoded do usuário
-USER_API_KEY = os.environ.get("AETHERA_KEY", os.environ.get("SOVEREIGN_KEY", "sk_aethera_LCPxn6Bl46xPljDyksxQlw"))
+USER_API_KEY = os.environ.get("AETHERA_KEY", os.environ.get("SOVEREIGN_KEY", "sk_aethera_kJIhaMXBPt-DaHb9uPjWPQ"))
 
 mcp = FastMCP("Aethera Cortex")
 brain = SovereignBrain(base_url="http://100.49.87.83:8001", api_key=USER_API_KEY)

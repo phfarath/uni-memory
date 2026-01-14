@@ -3,7 +3,7 @@ version: '3.8'
 services:
   memory-brain:
     build: .
-    container_name: sovereign-memory
+    container_name: aethera-cortex
     ports:
       - "8001:8001"
     env_file:

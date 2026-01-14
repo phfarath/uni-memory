@@ -1,1 +1,12 @@
-{"mcpServers":{"aethera-cortex":{"url":"http://100.49.87.83:8001","env":{"AETHERA_KEY":"sk_aethera_bJ1OmHCmW9rDL6UFIy6zWA"},"alwaysAllow":["remember"]}}}
+{
+  "mcpServers": {
+    "aethera-cloud": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sse-client",
+        "http://100.49.87.83:8001/mcp/sse?x-api-key=sk_aethera_kJIhaMXBPt-DaHb9uPjWPQ"
+      ]
+    }
+  }
+}
