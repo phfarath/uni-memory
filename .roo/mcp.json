@@ -1,1 +1,1 @@
-{"mcpServers":{"aethera-cloud":{"command":"npx","args":["-y","@modelcontextprotocol/server-sse-client","http://127.0.0.1:8001/mcp/sse?x-api-key=sk_aethera_kJIhaMXBPt-DaHb9uPjWPQ"],"disabled":false,"alwaysAllow":[]}}}
+{"mcpServers":{"aethera-cloud":{"type":"streamable-http","url":"http://127.0.0.1:8001/mcp","headers":{"x-api-key":"sk_aethera_kJIhaMXBPt-DaHb9uPjWPQ"},"disabled":false,"alwaysAllow":["recall"]}}}

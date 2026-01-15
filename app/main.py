@@ -325,6 +325,171 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             
     raise ValueError(f"Ferramenta desconhecida: {name}")
 
+# --- STREAMABLE HTTP TRANSPORT (MCP 2025) ---
+# Stores for managing sessions
+streamable_sessions: Dict[str, dict] = {}
+
+@app.post("/mcp")
+async def handle_streamable_http(request: Request):
+    """
+    Streamable HTTP transport endpoint (MCP 2025-03-26 spec).
+    Handles JSON-RPC messages via POST with optional SSE streaming response.
+    """
+    # Validate API key
+    api_key = request.query_params.get("x-api-key") or request.headers.get("x-api-key")
+    if not api_key:
+        return JSONResponse({"error": "Missing API key"}, status_code=403)
+    
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM api_keys WHERE key = %s AND is_active = TRUE", (api_key,))
+        authorized = c.fetchone()
+        conn.close()
+        if not authorized:
+            return JSONResponse({"error": "Invalid API key"}, status_code=403)
+    except Exception as e:
+        logger.error(f"Auth error: {e}")
+        return JSONResponse({"error": "Auth system error"}, status_code=500)
+    
+    # Get session ID from header or create new one
+    session_id = request.headers.get("mcp-session-id")
+    if not session_id:
+        session_id = str(uuid.uuid4())
+    
+    logger.info(f"DEBUG: Streamable HTTP request for session {session_id}")
+    
+    try:
+        body = await request.json()
+        logger.info(f"DEBUG: Received JSON-RPC: {str(body)[:200]}...")
+    except Exception as e:
+        logger.error(f"JSON parse error: {e}")
+        return JSONResponse({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}}, status_code=400)
+    
+    # Check Accept header to determine response type
+    accept_header = request.headers.get("accept", "application/json")
+    wants_sse = "text/event-stream" in accept_header
+    
+    # Handle the JSON-RPC message
+    from mcp.types import JSONRPCMessage, JSONRPCRequest, JSONRPCNotification
+    from pydantic import TypeAdapter
+    
+    # Log raw body for debugging
+    logger.info(f"DEBUG: Raw body type check - id={body.get('id')}, method={body.get('method')}")
+    
+    # Process directly from body instead of parsing through JSONRPCMessage union
+    # This is more reliable than dealing with the union type
+    method = body.get("method")
+    request_id = body.get("id")
+    params = body.get("params", {}) or {}
+    
+    # Notification = has method but no id
+    # Request = has method AND id
+    # Response = has no method (has result or error)
+    
+    is_request = method is not None and request_id is not None
+    is_notification = method is not None and request_id is None
+    
+    logger.info(f"DEBUG: is_request={is_request}, is_notification={is_notification}, method={method}, id={request_id}")
+    
+    if is_request:
+        # Process the request and return response
+        logger.info(f"DEBUG: Processing method '{method}' with id {request_id}")
+        
+        try:
+            if method == "initialize":
+                # Handle initialize request
+                response_result = {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {
+                        "tools": {"listChanged": False}
+                    },
+                    "serverInfo": {
+                        "name": "Aethera Cloud",
+                        "version": "2.1.0"
+                    }
+                }
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": response_result
+                }
+                # Include session ID in response header
+                headers = {"mcp-session-id": session_id}
+                return JSONResponse(response, headers=headers)
+                
+            elif method == "tools/list":
+                # Return list of available tools
+                tools = await list_tools()
+                tools_json = [{"name": t.name, "description": t.description, "inputSchema": t.inputSchema} for t in tools]
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {"tools": tools_json}
+                }
+                return JSONResponse(response)
+                
+            elif method == "tools/call":
+                # Execute a tool
+                tool_name = params.get("name")
+                tool_args = params.get("arguments", {})
+                
+                logger.info(f"DEBUG: Calling tool '{tool_name}' with args {tool_args}")
+                
+                result = await call_tool(tool_name, tool_args)
+                content_json = [{"type": c.type, "text": c.text} for c in result]
+                
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {"content": content_json, "isError": False}
+                }
+                return JSONResponse(response)
+                
+            elif method == "ping":
+                response = {"jsonrpc": "2.0", "id": request_id, "result": {}}
+                return JSONResponse(response)
+                
+            else:
+                # Method not found
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32601, "message": f"Method not found: {method}"}
+                }
+                return JSONResponse(response, status_code=200)
+                
+        except Exception as e:
+            logger.error(f"Error processing request: {e}")
+            import traceback
+            traceback.print_exc()
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": f"Internal error: {str(e)}"}
+            }
+            return JSONResponse(response, status_code=200)
+    
+    # Handle notifications (method but no id)
+    if is_notification:
+        logger.info(f"DEBUG: Received notification '{method}'")
+        # For notifications/initialized, just accept
+        return JSONResponse(status_code=202, content=None)
+    
+    # For responses or unknown, just accept
+    return JSONResponse(status_code=202, content=None)
+
+# Also support GET for backwards compatibility (returns SSE stream with endpoint info)
+@app.get("/mcp")
+async def handle_mcp_get(request: Request):
+    """
+    Backwards compatibility: GET requests fall back to SSE transport.
+    Redirects to /mcp/sse endpoint behavior.
+    """
+    # Forward to the SSE handler
+    return await handle_sse(request)
+
+# --- OLD SSE TRANSPORT (FOR BACKWARDS COMPATIBILITY) ---
 # Estrutura para segurar as pontas dos streams
 class SseSession:
     def __init__(self, post_sink, sse_source):
