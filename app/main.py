@@ -23,11 +23,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from mcp.server.fastmcp import FastMCP
+from app.rate_limiter import RateLimiter, ENDPOINT_ACTIONS, ACTION_REQUEST, cleanup_old_logs
 
 # --- CONFIGURAÇÃO ---
 # A URL deve vir do .env: postgres://user:pass@endpoint.neon.tech/dbname?sslmode=require
 DATABASE_URL = os.environ.get("DATABASE_URL")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+DB_SCHEMA = os.environ.get("DB_SCHEMA", "public")  # 'test' or 'public'
 
 # Configuração de Modelo (Embedding Local)
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
@@ -54,6 +56,14 @@ def get_db_connection():
         clean_url = clean_url.replace("psql ", "").strip()
         
     conn = psycopg2.connect(clean_url)
+    
+    # Set schema search path (test vs public)
+    if DB_SCHEMA and DB_SCHEMA != "public":
+        c = conn.cursor()
+        c.execute(f"SET search_path TO {DB_SCHEMA}, public")
+        conn.commit()
+        c.close()
+    
     return conn
 
 # --- MODELOS PYDANTIC ---
@@ -93,6 +103,36 @@ def init_db():
                         tier TEXT DEFAULT 'free'
                     )''')
         
+        # 4. Tabela de Definição de Tiers (Rate Limiting)
+        c.execute('''CREATE TABLE IF NOT EXISTS tier_definitions (
+                        tier TEXT PRIMARY KEY,
+                        display_name TEXT NOT NULL,
+                        max_requests_per_day INTEGER DEFAULT 100,
+                        max_memories INTEGER DEFAULT 1000,
+                        max_embeddings_per_day INTEGER DEFAULT 50,
+                        max_llm_calls_per_day INTEGER DEFAULT 0,
+                        priority INTEGER DEFAULT 0,
+                        created_at REAL
+                    )''')
+        
+        # 5. Tabela de Logs de Uso (Usage Tracking)
+        c.execute('''CREATE TABLE IF NOT EXISTS usage_logs (
+                        id SERIAL PRIMARY KEY,
+                        api_key TEXT NOT NULL,
+                        endpoint TEXT NOT NULL,
+                        method TEXT NOT NULL,
+                        action_type TEXT NOT NULL,
+                        timestamp REAL NOT NULL,
+                        response_status INTEGER,
+                        metadata JSONB,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )''')
+        
+        # Indexes for usage_logs
+        c.execute("CREATE INDEX IF NOT EXISTS idx_usage_key_time ON usage_logs(api_key, timestamp)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_usage_action ON usage_logs(action_type, timestamp)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_usage_cleanup ON usage_logs(created_at)")
+        
         conn.commit()
 
         # 4. Bootstrap Root Key
@@ -110,6 +150,26 @@ def init_db():
             c.execute("INSERT INTO api_keys (key, owner_name, is_active, created_at, tier) VALUES (%s, %s, TRUE, %s, 'root')", 
                       (root_key, "System Administrator", time.time()))
             conn.commit()
+        
+        # 5. Bootstrap Default Tiers (if empty)
+        c.execute("SELECT count(*) FROM tier_definitions")
+        tier_count = c.fetchone()[0]
+        
+        if tier_count == 0:
+            now = time.time()
+            default_tiers = [
+                ('free', 'Free', 100, 1000, 50, 0, 0, now),
+                ('pro', 'Pro', 5000, 50000, 1000, 100, 1, now),
+                ('team', 'Team', 50000, 500000, 10000, 1000, 2, now),
+                ('root', 'Admin', -1, -1, -1, -1, 99, now),  # -1 = unlimited
+            ]
+            for tier_data in default_tiers:
+                c.execute("""INSERT INTO tier_definitions 
+                            (tier, display_name, max_requests_per_day, max_memories, 
+                             max_embeddings_per_day, max_llm_calls_per_day, priority, created_at) 
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""", tier_data)
+            conn.commit()
+            logger.info(">>> [BOOT] Tiers padrão criados (free, pro, team, root).")
             
         c.close()
         conn.close()
@@ -120,6 +180,10 @@ def init_db():
 
 # Call init on module load
 init_db()
+
+# --- RATE LIMITER SINGLETON ---
+rate_limiter = RateLimiter(get_db_connection)
+logger.info(">>> [BOOT] Rate Limiter inicializado.")
 
 # --- SEGURANÇA (DUAL: HEADER OU QUERY) ---
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
@@ -178,6 +242,76 @@ class McpAuthMiddleware(BaseHTTPMiddleware):
 
         return await call_next(request)
 
+# --- RATE LIMIT MIDDLEWARE ---
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Middleware que verifica rate limits em endpoints protegidos."""
+    
+    # Endpoints que NÃO são rate-limited
+    SKIP_PATHS = {"/docs", "/openapi.json", "/health", "/", "/redoc"}
+    
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        method = request.method
+        
+        # Skip non-protected endpoints
+        if path in self.SKIP_PATHS or path.endswith("/docs"):
+            return await call_next(request)
+        
+        # Get API key (from header or query)
+        api_key = request.headers.get("x-api-key") or request.query_params.get("x-api-key")
+        
+        if not api_key:
+            # Let the auth middleware handle missing keys
+            return await call_next(request)
+        
+        # Get user tier
+        try:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("SELECT tier FROM api_keys WHERE key = %s AND is_active = TRUE", (api_key,))
+            row = c.fetchone()
+            conn.close()
+            
+            if not row:
+                return await call_next(request)  # Let auth middleware reject
+            
+            tier = row[0]
+        except Exception:
+            return await call_next(request)
+        
+        # Determine action type from endpoint
+        endpoint_key = f"{method} {path}"
+        action_type, _ = ENDPOINT_ACTIONS.get(endpoint_key, (ACTION_REQUEST, 1))
+        
+        # Check rate limit
+        is_allowed, usage_info = rate_limiter.check_limit(api_key, action_type, tier)
+        
+        if not is_allowed:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": "Rate limit exceeded",
+                    "tier": tier,
+                    "usage": usage_info,
+                    "message": f"Limite de {usage_info['limit']} {action_type}/dia atingido. Upgrade para aumentar."
+                },
+                headers={"Retry-After": "86400"}  # 24 hours
+            )
+        
+        # Execute request
+        response = await call_next(request)
+        
+        # Log usage (fire-and-forget)
+        rate_limiter.log_usage(
+            api_key=api_key,
+            endpoint=path,
+            method=method,
+            action_type=action_type,
+            status=response.status_code
+        )
+        
+        return response
+
 # --- MIDDLEWARES ---
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -190,6 +324,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(McpAuthMiddleware)
 
 # --- CORE LÓGICO COMPARTILHADO ---
@@ -781,6 +916,121 @@ async def update_memory(memory_id: int, update: MemoryUpdate, user: dict = Secur
     conn.close()
     if updated == 0: raise HTTPException(404, "Not found")
     return {"status": "updated"}
+
+# --- USAGE & TIER MANAGEMENT ENDPOINTS ---
+
+class TierUpgradeRequest(BaseModel):
+    new_tier: str
+
+@app.get("/v1/usage", tags=["Usage"])
+async def get_usage(user: dict = Security(verify_api_key)):
+    """Returns current usage stats for the authenticated user."""
+    return rate_limiter.get_full_usage_stats(user["key"], user["tier"])
+
+@app.get("/admin/usage/stats", tags=["Admin"])
+async def get_admin_usage_stats(user: dict = Security(verify_api_key)):
+    """Admin-only: Get aggregated usage stats across all users."""
+    if user['tier'] != 'root':
+        raise HTTPException(403, "Admin only")
+    
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # Total users by tier
+    c.execute("""
+        SELECT tier, COUNT(*) as count 
+        FROM api_keys 
+        WHERE is_active = TRUE 
+        GROUP BY tier
+    """)
+    tier_counts = {row[0]: row[1] for row in c.fetchall()}
+    
+    # Active today (users with usage logs today)
+    c.execute("""
+        SELECT COUNT(DISTINCT api_key) 
+        FROM usage_logs 
+        WHERE DATE(created_at) = CURRENT_DATE
+    """)
+    active_today = c.fetchone()[0]
+    
+    # Requests by tier today
+    c.execute("""
+        SELECT ak.tier, COUNT(ul.id) as requests
+        FROM usage_logs ul
+        JOIN api_keys ak ON ul.api_key = ak.key
+        WHERE DATE(ul.created_at) = CURRENT_DATE
+        GROUP BY ak.tier
+    """)
+    requests_by_tier = {row[0]: row[1] for row in c.fetchall()}
+    
+    conn.close()
+    
+    return {
+        "total_users": sum(tier_counts.values()),
+        "active_today": active_today,
+        "by_tier": {
+            tier: {
+                "users": tier_counts.get(tier, 0),
+                "requests_today": requests_by_tier.get(tier, 0)
+            }
+            for tier in ["free", "pro", "team", "root"]
+        }
+    }
+
+@app.post("/admin/users/{api_key}/upgrade", tags=["Admin"])
+async def upgrade_user_tier(api_key: str, request: TierUpgradeRequest, user: dict = Security(verify_api_key)):
+    """Admin-only: Upgrade or downgrade a user's tier."""
+    if user['tier'] != 'root':
+        raise HTTPException(403, "Admin only")
+    
+    # Validate new tier exists
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    c.execute("SELECT tier FROM tier_definitions WHERE tier = %s", (request.new_tier,))
+    if not c.fetchone():
+        conn.close()
+        raise HTTPException(400, f"Invalid tier: {request.new_tier}")
+    
+    # Get old tier
+    c.execute("SELECT tier FROM api_keys WHERE key = %s", (api_key,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, "API key not found")
+    
+    old_tier = row[0]
+    
+    # Update tier
+    c.execute("UPDATE api_keys SET tier = %s WHERE key = %s", (request.new_tier, api_key))
+    conn.commit()
+    conn.close()
+    
+    # Refresh rate limiter cache
+    rate_limiter._refresh_tier_cache()
+    
+    logger.info(f"[ADMIN] Tier upgrade: {api_key[:20]}... | {old_tier} -> {request.new_tier}")
+    
+    return {
+        "status": "upgraded",
+        "key": api_key[:20] + "...",
+        "old_tier": old_tier,
+        "new_tier": request.new_tier
+    }
+
+@app.get("/admin/tiers", tags=["Admin"])
+async def list_tiers(user: dict = Security(verify_api_key)):
+    """List all available tiers and their limits."""
+    if user['tier'] != 'root':
+        raise HTTPException(403, "Admin only")
+    
+    conn = get_db_connection()
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT * FROM tier_definitions ORDER BY priority")
+    rows = c.fetchall()
+    conn.close()
+    
+    return {"tiers": rows}
 
 if __name__ == "__main__":
     import uvicorn
