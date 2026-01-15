@@ -10,8 +10,8 @@ import time
 import sys
 
 # Configuration
-BASE_URL = "http://localhost:8001"
-ROOT_KEY = None # Set this to your root API key
+BASE_URL = "http://localhost:8001" # http://100.49.87.83:8001 (for remote testing)
+ROOT_KEY = None  # Set this to your root API key
 
 def get_root_key():
     """Get root key from file variable, environment, or prompt."""
