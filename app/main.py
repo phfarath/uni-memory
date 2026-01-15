@@ -371,7 +371,7 @@ async def handle_sse(request: Request):
     async def event_generator():
         # Constrói a URL ABSOLUTA do endpoint
         # Forçamos 127.0.0.1 para evitar problemas de DNS (localhost vs ::1)
-        base_url = "http://127.0.0.1:8001"
+        base_url = os.environ.get("MCP_PUBLIC_URL", "http://127.0.0.1:8001")
         endpoint_url = f"{base_url}/mcp/messages?session={session_id}"
         
         # Preserva a chave de API
