@@ -296,6 +296,40 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["query"]
             }
+        ),
+        Tool(
+            name="list_recent",
+            description="Lista as memórias mais recentes armazenadas.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Número máximo de memórias para retornar. Default: 10"}
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="update_memory",
+            description="Atualiza o conteúdo de uma memória existente pelo seu ID.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "integer", "description": "O ID da memória a ser atualizada."},
+                    "new_content": {"type": "string", "description": "O novo conteúdo para substituir o antigo."}
+                },
+                "required": ["memory_id", "new_content"]
+            }
+        ),
+        Tool(
+            name="forget",
+            description="Remove uma memória específica pelo seu ID.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "integer", "description": "O ID da memória a ser removida."}
+                },
+                "required": ["memory_id"]
+            }
         )
     ]
 
@@ -320,6 +354,64 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             for item in items:
                 report += f"- {item['content']}\n"
             return [TextContent(type="text", text=report)]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Erro: {e}")]
+    
+    elif name == "list_recent":
+        limit = arguments.get("limit", 10)
+        try:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("SELECT id, role, content, timestamp FROM memories ORDER BY id DESC LIMIT %s", (limit,))
+            rows = c.fetchall()
+            conn.close()
+            
+            if not rows:
+                return [TextContent(type="text", text="Nenhuma memória encontrada.")]
+            
+            report = f"ÚLTIMAS {len(rows)} MEMÓRIAS:\n"
+            for row in rows:
+                mem_id, role, content, ts = row
+                # Truncate long content for display
+                content_preview = content[:100] + "..." if len(content) > 100 else content
+                report += f"[ID:{mem_id}] ({role}) {content_preview}\n"
+            return [TextContent(type="text", text=report)]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Erro: {e}")]
+    
+    elif name == "update_memory":
+        memory_id = arguments.get("memory_id")
+        new_content = arguments.get("new_content")
+        try:
+            conn = get_db_connection()
+            c = conn.cursor()
+            # Generate new embedding for the updated content
+            new_vec = embed_model.encode([new_content])[0].tolist()
+            c.execute("UPDATE memories SET content = %s, embedding = %s WHERE id = %s", 
+                      (new_content, new_vec, memory_id))
+            updated = c.rowcount
+            conn.commit()
+            conn.close()
+            
+            if updated == 0:
+                return [TextContent(type="text", text=f"Memória com ID {memory_id} não encontrada.")]
+            return [TextContent(type="text", text=f"Memória {memory_id} atualizada com sucesso.")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Erro: {e}")]
+    
+    elif name == "forget":
+        memory_id = arguments.get("memory_id")
+        try:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("DELETE FROM memories WHERE id = %s", (memory_id,))
+            deleted = c.rowcount
+            conn.commit()
+            conn.close()
+            
+            if deleted == 0:
+                return [TextContent(type="text", text=f"Memória com ID {memory_id} não encontrada.")]
+            return [TextContent(type="text", text=f"Memória {memory_id} removida com sucesso.")]
         except Exception as e:
             return [TextContent(type="text", text=f"Erro: {e}")]
             
