@@ -1,0 +1,233 @@
+@project
+name: Aethera Cortex
+type: Memory Service + MCP Server
+status: production-ready
+primary_language: Python
+repo_layout: single
+last_updated: 2026-01-21
+
+@entry_points
+- name: FastAPI Server
+  kind: api
+  path: app/main.py
+  run: uvicorn app.main:app --host 0.0.0.0 --port 8001
+
+- name: MCP Server (Standalone)
+  kind: worker
+  path: mcp_server.py
+  run: python mcp_server.py
+
+- name: SSE Bridge
+  kind: worker
+  path: sse_bridge.py
+  run: python3 sse_bridge.py <SSE_URL>
+
+- name: Docker Container
+  kind: web
+  path: Dockerfile
+  run: docker-compose up -d
+
+@architecture
+pattern: REST API + MCP Protocol + RAG Pipeline
+main_flow:
+  - step: Client sends request
+    from: Claude Desktop / REST Client
+    to: FastAPI Gateway (port 8001)
+  
+  - step: Middleware validates auth & rate limit
+    from: FastAPI Gateway
+    to: RateLimitMiddleware + McpAuthMiddleware
+  
+  - step: RAG pipeline processes query
+    from: Endpoint Handler
+    to: SentenceTransformer + pgvector + OpenAI
+  
+  - step: Memory persisted in background
+    from: BackgroundTasks
+    to: PostgreSQL (Neon)
+
+components:
+  - name: FastAPI Gateway
+    path: app/main.py
+    depends_on:
+      - PostgreSQL
+      - SentenceTransformer
+      - OpenAI API
+  
+  - name: Rate Limiter
+    path: app/rate_limiter.py
+    depends_on:
+      - PostgreSQL
+  
+  - name: MCP Server
+    path: mcp_server.py
+    depends_on:
+      - client.py SDK
+      - FastAPI Gateway
+  
+  - name: Client SDK
+    path: client.py
+    depends_on:
+      - FastAPI Gateway
+  
+  - name: SSE Bridge
+    path: sse_bridge.py
+    depends_on:
+      - FastAPI Gateway
+
+@tech_stack
+runtime:
+  - Python 3.10+
+  - Uvicorn ASGI
+  - Docker
+
+framework:
+  - FastAPI
+  - Pydantic
+  - MCP (Model Context Protocol) v1.3.0
+
+database:
+  - PostgreSQL
+  - pgvector extension
+  - psycopg2-binary
+  - Neon.tech (managed)
+
+messaging:
+  - Server-Sent Events (SSE)
+  - Streamable HTTP (MCP 2025-03-26)
+  - anyio streams
+
+ai:
+  - SentenceTransformers (all-MiniLM-L6-v2)
+  - OpenAI API (gpt-3.5-turbo, gpt-4o)
+  - NumPy < 2.0.0
+
+observability:
+  - Python logging module
+  - TODO: OpenTelemetry
+
+infra:
+  - Docker + docker-compose
+  - Neon PostgreSQL Cloud
+  - TODO: CI/CD Pipeline
+
+@data_model
+entities:
+  - name: memories
+    kind: table
+    key_fields:
+      - id (SERIAL)
+      - session_id (TEXT)
+      - role (TEXT)
+      - content (TEXT)
+      - embedding (vector(384))
+    relations:
+      - None (isolated by session_id)
+  
+  - name: api_keys
+    kind: table
+    key_fields:
+      - key (TEXT, PRIMARY)
+      - owner_name (TEXT)
+      - tier (TEXT)
+      - is_active (BOOLEAN)
+    relations:
+      - tier -> tier_definitions.tier
+  
+  - name: tier_definitions
+    kind: table
+    key_fields:
+      - tier (TEXT, PRIMARY)
+      - max_requests_per_day (INTEGER)
+      - max_memories (INTEGER)
+      - max_embeddings_per_day (INTEGER)
+      - max_llm_calls_per_day (INTEGER)
+    relations:
+      - None
+  
+  - name: usage_logs
+    kind: table
+    key_fields:
+      - id (SERIAL)
+      - api_key (TEXT)
+      - endpoint (TEXT)
+      - action_type (TEXT)
+      - timestamp (REAL)
+    relations:
+      - api_key -> api_keys.key
+
+@key_files
+- purpose: Main API server and entry point
+  path: app/main.py
+
+- purpose: Rate limiting and usage tracking
+  path: app/rate_limiter.py
+
+- purpose: Standalone MCP server for Claude Desktop
+  path: mcp_server.py
+
+- purpose: Python SDK for Aethera API
+  path: client.py
+
+- purpose: SSE bridge for legacy MCP transport
+  path: sse_bridge.py
+
+- purpose: Container image definition
+  path: Dockerfile
+
+- purpose: Docker orchestration
+  path: docker-compose.yml
+
+- purpose: Python dependencies
+  path: requirements.txt
+
+- purpose: MCP configuration for Roo IDE
+  path: .roo/mcp.json
+
+@tests
+- kind: unit
+  path: tests/test_auth.py
+  run: python tests/test_auth.py
+
+- kind: integration
+  path: tests/test_crud.py
+  run: python tests/test_crud.py
+
+- kind: integration
+  path: tests/test_rate_limits.py
+  run: python tests/test_rate_limits.py
+
+- kind: integration
+  path: tests/test_sdk.py
+  run: python tests/test_sdk.py
+
+- kind: e2e
+  path: teste-de-validacao/attack.py
+  run: python teste-de-validacao/attack.py
+
+@implemented_features
+- API Key Authentication (header + query param)
+- Multi-Tier Rate Limiting (free, pro, team, root)
+- Usage Tracking and Reporting
+- Memory CRUD Operations
+- RAG Pipeline (embedding + pgvector + LLM)
+- MCP Protocol Support (SSE + Streamable HTTP)
+- 5 MCP Tools (remember, recall, list_recent, update, forget)
+- Admin Endpoints (create/revoke keys, upgrade tiers)
+- Multi-Session Support
+- Docker Deployment
+- Auto Schema Bootstrap
+- CORS Configuration
+- Logging Infrastructure
+
+@todo_next
+- Create .env.example documentation
+- Add api_key FK to memories table (multi-tenant isolation)
+- Implement API key rotation
+- Build usage dashboard frontend
+- Setup CI/CD pipeline (GitHub Actions)
+- Enhance OpenAPI documentation
+- Add webhook support for events
+- Implement backup automation
+- Performance profiling and optimization
+- Security audit and hardening
