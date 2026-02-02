@@ -6,11 +6,11 @@ on:
       - main
     paths:
       - '**'  # Ajustar se necessário
-      - '.github/workflows/deploy.yml'
+      - '.github/workflows/deploy-ec2.yml'
   workflow_dispatch:
 
 env:
-  AWS_REGION: <REGION>
+  AWS_REGION: us-east-1
   ECR_REPOSITORY: <ECR_REPOSITORY>
   ECR_REGISTRY: <ECR_REGISTRY>
 
