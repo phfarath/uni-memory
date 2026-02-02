@@ -1,0 +1,68 @@
+name: Deploy to AWS ECR
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**'  # Ajustar se necessário
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: <REGION>
+  ECR_REPOSITORY: <ECR_REPOSITORY>
+  ECR_REGISTRY: <ECR_REGISTRY>
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy Container
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag, and Push Image
+        run: |
+          docker build -t $ECR_REPOSITORY:latest .
+          docker tag $ECR_REPOSITORY:latest $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker tag $ECR_REPOSITORY:latest $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+            docker pull $ECR_REGISTRY/$ECR_REPOSITORY:latest
+            docker stop <CONTAINER_NAME> || true
+            docker rm <CONTAINER_NAME> || true
+            sudo docker run -d \
+              --name <CONTAINER_NAME> \
+              --restart unless-stopped \
+              -p <LOCAL_PORT>:<CONTAINER_PORT> \
+              --env-file /etc/<ENV_FILE> \
+              $ECR_REGISTRY/$ECR_REPOSITORY:latest
+            docker image prune -f
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Deploy Completed!" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`$ECR_REGISTRY/$ECR_REPOSITORY:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployed to:** \`${{ secrets.EC2_HOST }}\`" >> $GITHUB_STEP_SUMMARY
