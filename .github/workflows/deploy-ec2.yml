@@ -51,17 +51,23 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
-            docker pull $ECR_REGISTRY/$ECR_REPOSITORY:latest
-            docker stop <CONTAINER_NAME> || true
-            docker rm <CONTAINER_NAME> || true
-            sudo docker run -d \
-              --name <CONTAINER_NAME> \
-              --restart unless-stopped \
-              -p <LOCAL_PORT>:<CONTAINER_PORT> \
-              --env-file /etc/<ENV_FILE> \
-              $ECR_REGISTRY/$ECR_REPOSITORY:latest
-            docker image prune -f
+            set -e
+      
+            echo "📂 Indo para o diretório do projeto"
+            cd ~/aethera-cortex   # ajuste se o path for outro
+      
+            echo "🔐 Login no ECR"
+            aws ecr get-login-password --region us-east-1 \
+              | docker login --username AWS --password-stdin 593793042674.dkr.ecr.us-east-1.amazonaws.com
+      
+            echo "🛑 Derrubando containers"
+            docker compose down
+      
+            echo "⬇️ Pull da nova imagem"
+            docker pull 593793042674.dkr.ecr.us-east-1.amazonaws.com/aethera-cortex:latest
+      
+            echo "🚀 Subindo containers novos"
+            docker compose up -d
 
       - name: Summary
         run: |
