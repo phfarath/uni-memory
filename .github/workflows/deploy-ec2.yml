@@ -11,8 +11,8 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: <ECR_REPOSITORY>
-  ECR_REGISTRY: <ECR_REGISTRY>
+  ECR_REPOSITORY: aethera-cortex
+  ECR_REGISTRY: 593793042674.dkr.ecr.us-east-1.amazonaws.com
 
 jobs:
   build-and-deploy:
