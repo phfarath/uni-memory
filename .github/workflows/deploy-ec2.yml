@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - '**'  # Ajustar se necessário
+      - '**'
       - '.github/workflows/deploy-ec2.yml'
   workflow_dispatch:
 
@@ -18,7 +18,7 @@ jobs:
   build-and-deploy:
     name: Build and Deploy Container
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -33,18 +33,19 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, Tag, and Push Image
-        env:
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-          ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
-        run: |
-          docker build -t $ECR_REPOSITORY:latest .
-          docker tag $ECR_REPOSITORY:latest $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker tag $ECR_REPOSITORY:latest $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+      # 🔥 NECESSÁRIO PARA ARM64
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Deploy to EC2
+      - name: Build and Push Image (ARM64)
+        run: |
+          docker buildx build \
+            --platform linux/arm64 \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA} \
+            --push .
+
+      - name: Deploy to EC2 (Docker Compose)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -52,20 +53,20 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -e
-      
+
             echo "📂 Indo para o diretório do projeto"
-            cd ~/aethera-cortex   # ajuste se o path for outro
-      
+            cd ~/aethera-cortex
+
             echo "🔐 Login no ECR"
             aws ecr get-login-password --region us-east-1 \
               | docker login --username AWS --password-stdin 593793042674.dkr.ecr.us-east-1.amazonaws.com
-      
+
             echo "🛑 Derrubando containers"
             docker compose down
-      
+
             echo "⬇️ Pull da nova imagem"
             docker pull 593793042674.dkr.ecr.us-east-1.amazonaws.com/aethera-cortex:latest
-      
+
             echo "🚀 Subindo containers novos"
             docker compose up -d
 
