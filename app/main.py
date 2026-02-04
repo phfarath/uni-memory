@@ -11,6 +11,7 @@ import uuid
 import secrets
 import requests
 import logging
+import contextvars
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from pgvector.psycopg2 import register_vector
@@ -24,6 +25,7 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from mcp.server.fastmcp import FastMCP
 from app.rate_limiter import RateLimiter, ENDPOINT_ACTIONS, ACTION_REQUEST, cleanup_old_logs
+from app.auto_capture import auto_capture_engine, process_pending_events, cleanup_old_auto_capture_events
 
 # --- CONFIGURAÇÃO ---
 # A URL deve vir do .env: postgres://user:pass@endpoint.neon.tech/dbname?sslmode=require
@@ -74,6 +76,14 @@ class KeyRequest(BaseModel):
     owner_name: str
     tier: str = "free"
 
+class AutoCaptureToggle(BaseModel):
+    session_id: str
+
+class AutoCaptureEvent(BaseModel):
+    session_id: str
+    event_type: str
+    event_data: dict
+
 # --- BOOTSTRAP DO SCHEMA ---
 def init_db():
     """Inicializa o Schema no Postgres (Neon)."""
@@ -84,15 +94,21 @@ def init_db():
         # 1. Habilita Extensão Vetorial
         c.execute("CREATE EXTENSION IF NOT EXISTS vector")
         
-        # 2. Tabela de Memórias (Com vetor)
+        # 2. Tabela de Memórias (Com vetor + Multi-tenancy)
         c.execute(f'''CREATE TABLE IF NOT EXISTS memories (
                         id SERIAL PRIMARY KEY,
+                        owner_key TEXT NOT NULL,
+                        workspace TEXT DEFAULT 'default',
                         session_id TEXT NOT NULL,
                         role TEXT NOT NULL,
                         content TEXT NOT NULL,
                         timestamp REAL,
                         embedding vector({dim})
                     )''')
+        
+        # 2b. Indexes for multi-tenancy
+        c.execute("CREATE INDEX IF NOT EXISTS idx_memories_owner ON memories(owner_key)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_memories_workspace ON memories(owner_key, workspace)")
         
         # 3. Tabela de Autenticação
         c.execute('''CREATE TABLE IF NOT EXISTS api_keys (
@@ -111,6 +127,7 @@ def init_db():
                         max_memories INTEGER DEFAULT 1000,
                         max_embeddings_per_day INTEGER DEFAULT 50,
                         max_llm_calls_per_day INTEGER DEFAULT 0,
+                        max_auto_capture_per_day INTEGER DEFAULT 1000,
                         priority INTEGER DEFAULT 0,
                         created_at REAL
                     )''')
@@ -132,7 +149,24 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_usage_key_time ON usage_logs(api_key, timestamp)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_usage_action ON usage_logs(action_type, timestamp)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_usage_cleanup ON usage_logs(created_at)")
-        
+
+        # 6. Tabela de Eventos de Auto-Capture
+        c.execute('''CREATE TABLE IF NOT EXISTS auto_capture_events (
+                        id SERIAL PRIMARY KEY,
+                        owner_key TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        event_data JSONB NOT NULL,
+                        captured_at TIMESTAMPTZ DEFAULT NOW(),
+                        processed BOOLEAN DEFAULT FALSE,
+                        memory_id INTEGER REFERENCES memories(id)
+                    )''')
+
+        # Indexes for auto_capture_events
+        c.execute("CREATE INDEX IF NOT EXISTS idx_auto_capture_session ON auto_capture_events(session_id, captured_at DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_auto_capture_processed ON auto_capture_events(processed, captured_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_auto_capture_owner ON auto_capture_events(owner_key)")
+
         conn.commit()
 
         # 4. Bootstrap Root Key
@@ -157,17 +191,18 @@ def init_db():
         
         if tier_count == 0:
             now = time.time()
+            # (tier, display_name, max_requests, max_memories, max_embeddings, max_llm_calls, max_auto_capture, priority, created_at)
             default_tiers = [
-                ('free', 'Free', 100, 1000, 50, 0, 0, now),
-                ('pro', 'Pro', 5000, 50000, 1000, 100, 1, now),
-                ('team', 'Team', 50000, 500000, 10000, 1000, 2, now),
-                ('root', 'Admin', -1, -1, -1, -1, 99, now),  # -1 = unlimited
+                ('free', 'Free', 100, 1000, 50, 0, 100, 0, now),
+                ('pro', 'Pro', 5000, 50000, 1000, 100, 5000, 1, now),
+                ('team', 'Team', 50000, 500000, 10000, 1000, 50000, 2, now),
+                ('root', 'Admin', -1, -1, -1, -1, -1, 99, now),  # -1 = unlimited
             ]
             for tier_data in default_tiers:
-                c.execute("""INSERT INTO tier_definitions 
-                            (tier, display_name, max_requests_per_day, max_memories, 
-                             max_embeddings_per_day, max_llm_calls_per_day, priority, created_at) 
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""", tier_data)
+                c.execute("""INSERT INTO tier_definitions
+                            (tier, display_name, max_requests_per_day, max_memories,
+                             max_embeddings_per_day, max_llm_calls_per_day, max_auto_capture_per_day, priority, created_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""", tier_data)
             conn.commit()
             logger.info(">>> [BOOT] Tiers padrão criados (free, pro, team, root).")
             
@@ -329,42 +364,55 @@ app.add_middleware(McpAuthMiddleware)
 
 # --- CORE LÓGICO COMPARTILHADO ---
 
-def add_memory_trace_logic(session_id: str, role: str, content: str):
-    """Função síncrona/lógica pura para persistência."""
+def add_memory_trace_logic(owner_key: str, session_id: str, role: str, content: str, workspace: str = "default"):
+    """Função síncrona/lógica pura para persistência. Inclui owner_key para multi-tenancy."""
     try:
         # Vetorização
         vec = embed_model.encode([content])[0].tolist() 
         
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute("""INSERT INTO memories (session_id, role, content, timestamp, embedding) 
-                     VALUES (%s, %s, %s, %s, %s)""",
-                  (session_id, role, content, time.time(), vec))
+        c.execute("""INSERT INTO memories (owner_key, workspace, session_id, role, content, timestamp, embedding) 
+                     VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                  (owner_key, workspace, session_id, role, content, time.time(), vec))
         conn.commit()
         conn.close()
-        logger.info(f"DEBUG [MEMORY] Trace persistido no Neon.")
+        logger.info(f"DEBUG [MEMORY] Trace persistido para owner {owner_key[:20]}...")
     except Exception as e:
         logger.error(f"CRITICAL [MEMORY] Falha ao gravar no Postgres: {e}")
         raise e
 
-def retrieve_context_logic(session_id: str, query: str, limit_k: int = 5) -> List[Dict]:
+def retrieve_context_logic(owner_key: str, session_id: str, query: str, workspace: str = None, limit_k: int = 5) -> List[Dict]:
+    """Recupera contexto filtrado pelo owner_key e opcionalmente por workspace."""
     context_items = []
     conn = get_db_connection()
     c = conn.cursor()
     
-    # 1. Curto Prazo
-    c.execute("SELECT role, content FROM memories WHERE session_id = %s ORDER BY id DESC LIMIT 3", (session_id,))
+    # 1. Curto Prazo - filter by owner
+    c.execute("""SELECT role, content FROM memories 
+                 WHERE owner_key = %s AND session_id = %s 
+                 ORDER BY id DESC LIMIT 3""", (owner_key, session_id))
     recent = c.fetchall()
     for r in reversed(recent):
         context_items.append({"source": "short_term", "role": r[0], "content": r[1]})
         
-    # 2. Longo Prazo (pgvector)
+    # 2. Longo Prazo (pgvector) - filter by owner and optionally workspace
     q_vec = embed_model.encode([query])[0].tolist()
-    c.execute("""SELECT role, content, (embedding <=> %s::vector) as distance 
-                 FROM memories 
-                 ORDER BY distance ASC 
-                 LIMIT %s""", 
-              (q_vec, limit_k))
+    
+    if workspace:
+        c.execute("""SELECT role, content, (embedding <=> %s::vector) as distance 
+                     FROM memories 
+                     WHERE owner_key = %s AND workspace = %s
+                     ORDER BY distance ASC 
+                     LIMIT %s""", 
+                  (q_vec, owner_key, workspace, limit_k))
+    else:
+        c.execute("""SELECT role, content, (embedding <=> %s::vector) as distance 
+                     FROM memories 
+                     WHERE owner_key = %s
+                     ORDER BY distance ASC 
+                     LIMIT %s""", 
+                  (q_vec, owner_key, limit_k))
     
     vectors = c.fetchall()
     conn.close()
@@ -375,8 +423,9 @@ def retrieve_context_logic(session_id: str, query: str, limit_k: int = 5) -> Lis
     return context_items
 
 # Wrapper Async para FastAPI BackgroundTasks
-def add_memory_trace(session_id: str, role: str, content: str, background_tasks: BackgroundTasks):
-    background_tasks.add_task(add_memory_trace_logic, session_id, role, content)
+def add_memory_trace(owner_key: str, session_id: str, role: str, content: str, background_tasks: BackgroundTasks, workspace: str = "default"):
+    background_tasks.add_task(add_memory_trace_logic, owner_key, session_id, role, content, workspace)
+
 
 def execute_llm_call(model_name: str, system_context: str, user_query: str):
     if not OPENAI_API_KEY: return "Sem OPENAI_API_KEY configurada."
@@ -465,26 +514,66 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["memory_id"]
             }
+        ),
+        Tool(
+            name="enable_auto_capture",
+            description="Ativa captura automática de contexto para a sessão atual. Quando ativado, comandos, edições de arquivos, erros e decisões são automaticamente gravados como memórias.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "ID da sessão para ativar auto-capture."}
+                },
+                "required": ["session_id"]
+            }
+        ),
+        Tool(
+            name="disable_auto_capture",
+            description="Desativa captura automática de contexto para a sessão.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "ID da sessão para desativar auto-capture."}
+                },
+                "required": ["session_id"]
+            }
+        ),
+        Tool(
+            name="auto_capture_status",
+            description="Verifica o status de auto-capture para uma sessão.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "ID da sessão para verificar."}
+                },
+                "required": ["session_id"]
+            }
         )
     ]
 
 # Execução das Ferramentas
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    # Get owner_key from context (set by POST handler)
+    owner_key = current_api_key.get()
+    if not owner_key:
+        return [TextContent(type="text", text="Erro: Sessão não autenticada.")]
+    
     if name == "remember":
         fact = arguments.get("fact")
         category = arguments.get("category", "general")
+        workspace = arguments.get("workspace", "default")
         try:
             enriched = f"[{category.upper()}] {fact}"
-            add_memory_trace_logic("mcp-sse-session", "user", enriched)
+            add_memory_trace_logic(owner_key, "mcp-session", "user", enriched, workspace)
             return [TextContent(type="text", text="Memória salva com sucesso na Nuvem Aethera.")]
         except Exception as e:
             return [TextContent(type="text", text=f"Erro interno: {e}")]
             
     elif name == "recall":
         query = arguments.get("query")
+        workspace = arguments.get("workspace")  # None = search all workspaces
         try:
-            items = retrieve_context_logic("mcp-sse-session", query)
+            items = retrieve_context_logic(owner_key, "mcp-session", query, workspace)
             report = "MEMÓRIA RECUPERADA:\n"
             for item in items:
                 report += f"- {item['content']}\n"
@@ -494,10 +583,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     
     elif name == "list_recent":
         limit = arguments.get("limit", 10)
+        workspace = arguments.get("workspace")
         try:
             conn = get_db_connection()
             c = conn.cursor()
-            c.execute("SELECT id, role, content, timestamp FROM memories ORDER BY id DESC LIMIT %s", (limit,))
+            
+            # Filter by owner (and optionally workspace)
+            if workspace:
+                c.execute("""SELECT id, role, content, timestamp, workspace FROM memories 
+                             WHERE owner_key = %s AND workspace = %s 
+                             ORDER BY id DESC LIMIT %s""", (owner_key, workspace, limit))
+            else:
+                c.execute("""SELECT id, role, content, timestamp, workspace FROM memories 
+                             WHERE owner_key = %s 
+                             ORDER BY id DESC LIMIT %s""", (owner_key, limit))
             rows = c.fetchall()
             conn.close()
             
@@ -506,10 +605,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             
             report = f"ÚLTIMAS {len(rows)} MEMÓRIAS:\n"
             for row in rows:
-                mem_id, role, content, ts = row
+                mem_id, role, content, ts, ws = row
                 # Truncate long content for display
                 content_preview = content[:100] + "..." if len(content) > 100 else content
-                report += f"[ID:{mem_id}] ({role}) {content_preview}\n"
+                report += f"[ID:{mem_id}] ({ws}) {content_preview}\n"
             return [TextContent(type="text", text=report)]
         except Exception as e:
             return [TextContent(type="text", text=f"Erro: {e}")]
@@ -520,10 +619,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         try:
             conn = get_db_connection()
             c = conn.cursor()
+            
+            # Verify ownership before update
+            c.execute("SELECT id FROM memories WHERE id = %s AND owner_key = %s", (memory_id, owner_key))
+            if not c.fetchone():
+                conn.close()
+                return [TextContent(type="text", text=f"Memória {memory_id} não encontrada ou sem permissão.")]
+            
             # Generate new embedding for the updated content
             new_vec = embed_model.encode([new_content])[0].tolist()
-            c.execute("UPDATE memories SET content = %s, embedding = %s WHERE id = %s", 
-                      (new_content, new_vec, memory_id))
+            c.execute("UPDATE memories SET content = %s, embedding = %s WHERE id = %s AND owner_key = %s", 
+                      (new_content, new_vec, memory_id, owner_key))
             updated = c.rowcount
             conn.commit()
             conn.close()
@@ -539,17 +645,58 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         try:
             conn = get_db_connection()
             c = conn.cursor()
-            c.execute("DELETE FROM memories WHERE id = %s", (memory_id,))
+
+            # Verify ownership before delete
+            c.execute("DELETE FROM memories WHERE id = %s AND owner_key = %s", (memory_id, owner_key))
             deleted = c.rowcount
             conn.commit()
             conn.close()
-            
+
             if deleted == 0:
-                return [TextContent(type="text", text=f"Memória com ID {memory_id} não encontrada.")]
+                return [TextContent(type="text", text=f"Memória {memory_id} não encontrada ou sem permissão.")]
             return [TextContent(type="text", text=f"Memória {memory_id} removida com sucesso.")]
         except Exception as e:
             return [TextContent(type="text", text=f"Erro: {e}")]
-            
+
+    elif name == "enable_auto_capture":
+        session_id = arguments.get("session_id")
+        try:
+            auto_capture_engine.enable_for_session(session_id, owner_key)
+            return [TextContent(type="text", text=f"Auto-capture ativado para sessão '{session_id}'. Comandos, edições, erros e decisões serão capturados automaticamente.")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Erro: {e}")]
+
+    elif name == "disable_auto_capture":
+        session_id = arguments.get("session_id")
+        try:
+            auto_capture_engine.disable_for_session(session_id)
+            return [TextContent(type="text", text=f"Auto-capture desativado para sessão '{session_id}'.")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Erro: {e}")]
+
+    elif name == "auto_capture_status":
+        session_id = arguments.get("session_id")
+        try:
+            is_enabled = auto_capture_engine.is_enabled(session_id)
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("""
+                SELECT COUNT(*) as total,
+                       COUNT(CASE WHEN processed THEN 1 END) as processed
+                FROM auto_capture_events
+                WHERE session_id = %s AND owner_key = %s
+            """, (session_id, owner_key))
+            stats = c.fetchone()
+            conn.close()
+
+            status_text = f"Status Auto-Capture para sessão '{session_id}':\n"
+            status_text += f"- Ativo: {'Sim' if is_enabled else 'Não'}\n"
+            status_text += f"- Total de eventos: {stats[0]}\n"
+            status_text += f"- Eventos processados: {stats[1]}"
+            return [TextContent(type="text", text=status_text)]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Erro: {e}")]
+
     raise ValueError(f"Ferramenta desconhecida: {name}")
 
 # --- STREAMABLE HTTP TRANSPORT (MCP 2025) ---
@@ -719,17 +866,22 @@ async def handle_mcp_get(request: Request):
 # --- OLD SSE TRANSPORT (FOR BACKWARDS COMPATIBILITY) ---
 # Estrutura para segurar as pontas dos streams
 class SseSession:
-    def __init__(self, post_sink, sse_source):
+    def __init__(self, post_sink, sse_source, api_key: str = None):
         self.post_sink = post_sink   # Onde escrevemos o que vem do POST
         self.sse_source = sse_source # De onde lemos para mandar pro SSE
+        self.api_key = api_key       # Owner key for multi-tenancy
 
 # Store sessions
 sse_sessions: Dict[str, SseSession] = {}
 
+# Context variable to pass API key to tool handlers during MCP request processing
+current_api_key: contextvars.ContextVar[str] = contextvars.ContextVar('current_api_key', default=None)
+
 @app.get("/mcp/sse")
 async def handle_sse(request: Request):
     session_id = str(uuid.uuid4())
-    logger.info(f"DEBUG: Starting SSE Session {session_id}")
+    api_key = request.query_params.get("x-api-key") or request.headers.get("x-api-key")
+    logger.info(f"DEBUG: Starting SSE Session {session_id} for key {api_key[:20] if api_key else 'NONE'}...")
 
     # Cria canais AnyIO
     # Docs: send_stream, receive_stream = create_memory_object_stream(buffer_size)
@@ -740,12 +892,10 @@ async def handle_sse(request: Request):
     # Canal 2: Server (Send) -> Cliente SSE (Recv)
     server_send, sse_recv = anyio.create_memory_object_stream(10)
     
-    # Armazena as pontas 'Client-Side' na sessão
+    # Armazena as pontas 'Client-Side' na sessão (incluindo API key para multi-tenancy)
     # post_sink = onde o endpoint POST escreve (send stream)
     # sse_source = onde o endpoint GET lê (recv stream)
-    sse_sessions[session_id] = SseSession(post_send, sse_recv)
-    
-    api_key = request.query_params.get("x-api-key")
+    sse_sessions[session_id] = SseSession(post_send, sse_recv, api_key)
     async def run_server_loop():
         logger.info(f"DEBUG: MCP Server Loop STARTED for {session_id}")
         try:
@@ -810,6 +960,9 @@ async def handle_messages(request: Request):
         logger.warning(f"DEBUG: Session {session_id} not found in {list(sse_sessions.keys())}")
         return JSONResponse({"error": "Session not found"}, 404)
     
+    # Set API key context for tool handlers
+    token = current_api_key.set(session.api_key)
+    
     try:
         body = await request.json()
         
@@ -829,6 +982,9 @@ async def handle_messages(request: Request):
     except Exception as e:
         logger.error(f"Message Post Error: {e}")
         return JSONResponse({"error": str(e)}, 500)
+    finally:
+        # Reset context
+        current_api_key.reset(token)
 
 # --- ENDPOINTS REST CLASSICOS ---
 
@@ -863,12 +1019,14 @@ async def chat_protocol(request: Request, background_tasks: BackgroundTasks, use
     user_query = messages[-1]['content']
     session_id = body.get("session_id", "default")
     model = body.get("model", "gpt-3.5-turbo")
+    workspace = body.get("workspace", "default")
+    owner_key = user["key"]
     
-    # 1. Retrieve
-    ctx = retrieve_context_logic(session_id, user_query)
+    # 1. Retrieve (filtered by owner)
+    ctx = retrieve_context_logic(owner_key, session_id, user_query, workspace)
     
     if model == "memory-only":
-        add_memory_trace(session_id, "user", user_query, background_tasks)
+        add_memory_trace(owner_key, session_id, "user", user_query, background_tasks, workspace)
         return JSONResponse({"choices": [{"message": {"role": "assistant", "content": "Memorized."}}]})
         
     # 2. Prompt
@@ -877,40 +1035,59 @@ async def chat_protocol(request: Request, background_tasks: BackgroundTasks, use
     # 3. Exec
     resp = execute_llm_call(model, sys_txt, user_query)
     
-    # 4. Save
-    add_memory_trace(session_id, "user", user_query, background_tasks)
-    add_memory_trace(session_id, "assistant", resp, background_tasks)
+    # 4. Save (with owner_key)
+    add_memory_trace(owner_key, session_id, "user", user_query, background_tasks, workspace)
+    add_memory_trace(owner_key, session_id, "assistant", resp, background_tasks, workspace)
     
     return JSONResponse({"choices": [{"message": {"role": "assistant", "content": resp}}]})
 
-# CRUD
+# CRUD (filtered by owner)
 @app.get("/v1/memories")
-async def list_memories(limit: int = 10, offset: int = 0, user: dict = Security(verify_api_key)):
+async def list_memories(limit: int = 10, offset: int = 0, workspace: str = None, user: dict = Security(verify_api_key)):
+    owner_key = user["key"]
     conn = get_db_connection()
     curr = conn.cursor(cursor_factory=RealDictCursor)
-    curr.execute("SELECT id, role, content, timestamp, session_id FROM memories ORDER BY id DESC LIMIT %s OFFSET %s", (limit, offset))
-    rows = curr.fetchall() # Returns list of dicts
+    
+    if workspace:
+        curr.execute("""SELECT id, role, content, timestamp, session_id, workspace FROM memories 
+                        WHERE owner_key = %s AND workspace = %s 
+                        ORDER BY id DESC LIMIT %s OFFSET %s""", (owner_key, workspace, limit, offset))
+    else:
+        curr.execute("""SELECT id, role, content, timestamp, session_id, workspace FROM memories 
+                        WHERE owner_key = %s 
+                        ORDER BY id DESC LIMIT %s OFFSET %s""", (owner_key, limit, offset))
+    rows = curr.fetchall()
     conn.close()
     return {"data": rows}
 
 @app.delete("/v1/memories/{memory_id}")
 async def delete_memory(memory_id: int, user: dict = Security(verify_api_key)):
+    owner_key = user["key"]
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("DELETE FROM memories WHERE id = %s", (memory_id,))
+    # Verify ownership before delete
+    c.execute("DELETE FROM memories WHERE id = %s AND owner_key = %s", (memory_id, owner_key))
     deleted = c.rowcount
     conn.commit()
     conn.close()
-    if deleted == 0: raise HTTPException(404, "Not found")
+    if deleted == 0: raise HTTPException(404, "Not found or no permission")
     return {"status": "deleted"}
 
 @app.put("/v1/memories/{memory_id}")
 async def update_memory(memory_id: int, update: MemoryUpdate, user: dict = Security(verify_api_key)):
+    owner_key = user["key"]
     conn = get_db_connection()
     c = conn.cursor()
+    
+    # Verify ownership before update
+    c.execute("SELECT id FROM memories WHERE id = %s AND owner_key = %s", (memory_id, owner_key))
+    if not c.fetchone():
+        conn.close()
+        raise HTTPException(404, "Not found or no permission")
+    
     new_vec = embed_model.encode([update.content])[0].tolist()
-    c.execute("UPDATE memories SET content = %s, embedding = %s WHERE id = %s", 
-              (update.content, new_vec, memory_id))
+    c.execute("UPDATE memories SET content = %s, embedding = %s WHERE id = %s AND owner_key = %s", 
+              (update.content, new_vec, memory_id, owner_key))
     updated = c.rowcount
     conn.commit()
     conn.close()
@@ -1023,14 +1200,108 @@ async def list_tiers(user: dict = Security(verify_api_key)):
     """List all available tiers and their limits."""
     if user['tier'] != 'root':
         raise HTTPException(403, "Admin only")
-    
+
     conn = get_db_connection()
     c = conn.cursor(cursor_factory=RealDictCursor)
     c.execute("SELECT * FROM tier_definitions ORDER BY priority")
     rows = c.fetchall()
     conn.close()
-    
+
     return {"tiers": rows}
+
+# --- AUTO-CAPTURE ENDPOINTS ---
+
+@app.post("/v1/auto-capture/enable", tags=["Auto-Capture"])
+async def enable_auto_capture(toggle: AutoCaptureToggle, user: dict = Security(verify_api_key)):
+    """Enable auto-capture for a session."""
+    owner_key = user["key"]
+    auto_capture_engine.enable_for_session(toggle.session_id, owner_key)
+    return {"status": "enabled", "session_id": toggle.session_id}
+
+@app.post("/v1/auto-capture/disable", tags=["Auto-Capture"])
+async def disable_auto_capture(toggle: AutoCaptureToggle, user: dict = Security(verify_api_key)):
+    """Disable auto-capture for a session."""
+    auto_capture_engine.disable_for_session(toggle.session_id)
+    return {"status": "disabled", "session_id": toggle.session_id}
+
+@app.get("/v1/auto-capture/status", tags=["Auto-Capture"])
+async def get_auto_capture_status(session_id: str, user: dict = Security(verify_api_key)):
+    """Get auto-capture status and stats for a session."""
+    owner_key = user["key"]
+    is_enabled = auto_capture_engine.is_enabled(session_id)
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("""
+        SELECT COUNT(*) as total,
+               COUNT(CASE WHEN processed THEN 1 END) as processed
+        FROM auto_capture_events
+        WHERE session_id = %s AND owner_key = %s
+    """, (session_id, owner_key))
+    stats = c.fetchone()
+    conn.close()
+
+    return {
+        "session_id": session_id,
+        "enabled": is_enabled,
+        "total_events": stats[0],
+        "processed_events": stats[1],
+        "pending_events": stats[0] - stats[1]
+    }
+
+@app.post("/v1/auto-capture/event", tags=["Auto-Capture"])
+async def capture_event(event: AutoCaptureEvent, user: dict = Security(verify_api_key)):
+    """Capture an event for processing. Only works if auto-capture is enabled for the session."""
+    owner_key = user["key"]
+
+    # Check if auto-capture is enabled for this session
+    if not auto_capture_engine.is_enabled(event.session_id):
+        return {"status": "skipped", "reason": "auto-capture not enabled for this session"}
+
+    # Check if owner matches
+    session_owner = auto_capture_engine.get_owner_key(event.session_id)
+    if session_owner != owner_key:
+        raise HTTPException(403, "Session belongs to different owner")
+
+    # Insert event into database for background processing
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        import json
+        c.execute("""
+            INSERT INTO auto_capture_events (owner_key, session_id, event_type, event_data)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+        """, (owner_key, event.session_id, event.event_type, json.dumps(event.event_data)))
+        event_id = c.fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        return {"status": "captured", "event_id": event_id, "session_id": event.session_id}
+    except Exception as e:
+        logger.error(f"[AUTO_CAPTURE] Failed to capture event: {e}")
+        raise HTTPException(500, f"Failed to capture event: {e}")
+
+# --- BACKGROUND WORKER SETUP ---
+import schedule
+
+def run_auto_capture_scheduler():
+    """Background scheduler for auto-capture processing."""
+    schedule.every(30).seconds.do(
+        process_pending_events, get_db_connection, add_memory_trace_logic
+    )
+    schedule.every().sunday.at("03:00").do(
+        cleanup_old_auto_capture_events, get_db_connection, 30
+    )
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+# Start background worker thread
+auto_capture_thread = threading.Thread(target=run_auto_capture_scheduler, daemon=True)
+auto_capture_thread.start()
+logger.info(">>> [BOOT] Auto-Capture background worker iniciado.")
 
 if __name__ == "__main__":
     import uvicorn

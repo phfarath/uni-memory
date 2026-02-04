@@ -16,6 +16,7 @@ ACTION_REQUEST = "request"
 ACTION_MEMORY_WRITE = "memory_write"
 ACTION_EMBEDDING = "embedding"
 ACTION_LLM_CALL = "llm_call"
+ACTION_AUTO_CAPTURE = "auto_capture"
 
 # Endpoint to action type mapping
 ENDPOINT_ACTIONS: Dict[str, Tuple[str, int]] = {
@@ -24,6 +25,11 @@ ENDPOINT_ACTIONS: Dict[str, Tuple[str, int]] = {
     "POST /v1/chat/completions": (ACTION_LLM_CALL, 1),
     "DELETE /v1/memories": (ACTION_REQUEST, 1),
     "PUT /v1/memories": (ACTION_MEMORY_WRITE, 1),
+    # Auto-Capture Endpoints
+    "POST /v1/auto-capture/enable": (ACTION_AUTO_CAPTURE, 1),
+    "POST /v1/auto-capture/disable": (ACTION_AUTO_CAPTURE, 1),
+    "POST /v1/auto-capture/event": (ACTION_AUTO_CAPTURE, 1),
+    "GET /v1/auto-capture/status": (ACTION_REQUEST, 1),
     # MCP Endpoints
     "POST /mcp": (ACTION_REQUEST, 1),
     "POST /mcp/messages": (ACTION_REQUEST, 1),
@@ -33,6 +39,8 @@ ENDPOINT_ACTIONS: Dict[str, Tuple[str, int]] = {
     "tool:list_recent": (ACTION_REQUEST, 1),
     "tool:update_memory": (ACTION_MEMORY_WRITE, 1),
     "tool:forget": (ACTION_REQUEST, 1),
+    "tool:enable_auto_capture": (ACTION_AUTO_CAPTURE, 1),
+    "tool:disable_auto_capture": (ACTION_AUTO_CAPTURE, 1),
 }
 
 
@@ -55,19 +63,21 @@ class RateLimiter:
         try:
             conn = self.get_db_connection()
             c = conn.cursor()
-            c.execute("""SELECT tier, max_requests_per_day, max_memories, 
-                                max_embeddings_per_day, max_llm_calls_per_day 
+            c.execute("""SELECT tier, max_requests_per_day, max_memories,
+                                max_embeddings_per_day, max_llm_calls_per_day,
+                                COALESCE(max_auto_capture_per_day, 1000)
                          FROM tier_definitions""")
             rows = c.fetchall()
             conn.close()
-            
+
             with self._lock:
                 self._tier_cache = {
                     row[0]: {
                         "max_requests": row[1],
                         "max_memories": row[2],
                         "max_embeddings": row[3],
-                        "max_llm_calls": row[4]
+                        "max_llm_calls": row[4],
+                        "max_auto_capture": row[5]
                     }
                     for row in rows
                 }
@@ -110,14 +120,12 @@ class RateLimiter:
             return {}
     
     def get_memory_count(self, api_key: str) -> int:
-        """Get total memories stored for this API key."""
+        """Get total memories stored for this API key (owner)."""
         try:
             conn = self.get_db_connection()
             c = conn.cursor()
-            # Count memories across all sessions for this key
-            # Since memories table doesn't have api_key, we count all for now
-            # TODO: Add api_key to memories table for proper multi-tenant counting
-            c.execute("SELECT COUNT(*) FROM memories")
+            # Count memories owned by this key (multi-tenant)
+            c.execute("SELECT COUNT(*) FROM memories WHERE owner_key = %s", (api_key,))
             count = c.fetchone()[0]
             conn.close()
             return count
@@ -169,7 +177,8 @@ class RateLimiter:
             ACTION_REQUEST: "max_requests",
             ACTION_MEMORY_WRITE: "max_memories",
             ACTION_EMBEDDING: "max_embeddings",
-            ACTION_LLM_CALL: "max_llm_calls"
+            ACTION_LLM_CALL: "max_llm_calls",
+            ACTION_AUTO_CAPTURE: "max_auto_capture"
         }
         return limits.get(mapping.get(action_type, "max_requests"), 100)
     
@@ -235,7 +244,8 @@ class RateLimiter:
                     "limit": limits.get("max_memories", 1000) if limits.get("max_memories", 0) != -1 else "unlimited"
                 },
                 "embeddings": stat(ACTION_EMBEDDING, "max_embeddings"),
-                "llm_calls": stat(ACTION_LLM_CALL, "max_llm_calls")
+                "llm_calls": stat(ACTION_LLM_CALL, "max_llm_calls"),
+                "auto_capture": stat(ACTION_AUTO_CAPTURE, "max_auto_capture")
             },
             "reset_at": tomorrow.isoformat()
         }
