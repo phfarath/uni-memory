@@ -75,48 +75,37 @@ Cada README contém:
 ## 🚀 Quick Start
 
 ### Pré-requisitos
-- Python 3.10+
-- PostgreSQL com pgvector
-- OpenAI API key (para LLM calls)
+- Docker e Docker Compose
 
-### 1. Instalação
+### 1. Setup
 
 ```bash
-# Clone
 git clone https://github.com/phfarath/uni-memory.git
 cd uni-memory
-
-# Install dependencies
-pip install -r requirements.txt
+cp .env.example .env
 ```
 
-### 2. Configuração
+Os defaults funcionam direto para desenvolvimento local. Edite `.env` se precisar mudar senhas ou usar banco cloud.
+
+### 2. Iniciar
 
 ```bash
-# Crie .env (ou export direto)
-cat > .env << EOF
-DATABASE_URL="postgresql://user:pass@host:5432/dbname?sslmode=require"
-OPENAI_API_KEY="sk-proj-..."
-EOF
+docker compose up --build
 ```
 
-### 3. Run
+Primeira execução:
+- Builda a imagem (baixa modelo de embedding)
+- Inicia PostgreSQL com pgvector
+- Cria todas as tabelas e índices automaticamente
+- Gera root API key (aparece nos logs - salve-a!)
 
-```bash
-# Local
-uvicorn app.main:app --host 0.0.0.0 --port 8001
-
-# Ou com Docker
-docker-compose up -d
-```
-
-### 4. Teste
+### 3. Verificar
 
 ```bash
 # Health check
 curl http://localhost:8001/
 
-# Criar API key (primeira execução gera ROOT key, checar logs)
+# Criar API key (use a ROOT key dos logs)
 export ROOT_KEY="sk_aethera_root_..."
 
 curl -X POST http://localhost:8001/admin/keys/create \
@@ -133,6 +122,39 @@ curl -X POST http://localhost:8001/v1/chat/completions \
     "session_id": "test",
     "messages": [{"role": "user", "content": "Meu nome é João"}]
   }'
+```
+
+### Usar Banco Cloud (Neon.tech)
+
+Edite `.env` e troque o `DATABASE_URL`:
+
+```env
+DATABASE_URL=postgresql://user:pass@ep-xxxx.neon.tech/dbname?sslmode=require
+```
+
+Inicie apenas o app (sem o banco local):
+
+```bash
+docker compose up memory-brain --build
+```
+
+### Desenvolvimento Local (sem Docker)
+
+```bash
+pip install -r requirements.txt
+# Configure DATABASE_URL no .env apontando para um PostgreSQL com pgvector
+uvicorn app.main:app --host 0.0.0.0 --port 8001
+```
+
+### Comandos Úteis
+
+```bash
+docker compose logs -f memory-brain          # Ver logs
+docker compose down -v                        # Reset total (apaga dados)
+docker compose up --build                     # Rebuild após mudanças
+
+# Conectar ao banco local
+psql postgresql://aethera:aethera_secret@localhost:5432/aethera_cortex
 ```
 
 ---

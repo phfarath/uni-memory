@@ -1,6 +1,21 @@
 version: '3.8'
 
 services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: aethera-db
+    env_file:
+      - .env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aethera} -d ${POSTGRES_DB:-aethera_cortex}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   memory-brain:
     build: .
     container_name: aethera-cortex
@@ -8,8 +23,14 @@ services:
       - "8001:8001"
     env_file:
       - .env
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
     deploy:
       resources:
         limits:
-          memory: 2G # Limite de segurança para o modelo de embedding
+          memory: 2G
+
+volumes:
+  pgdata:
