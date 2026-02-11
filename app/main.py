@@ -80,6 +80,7 @@ class KeyRequest(BaseModel):
 class DuplicateCheckRequest(BaseModel):
     content: str
     session_id: str = "default"
+    workspace: str = "default"
 
 class AutoCaptureToggle(BaseModel):
     session_id: str
@@ -380,9 +381,9 @@ def add_memory_trace_logic(owner_key: str, session_id: str, role: str, content: 
 
         # Duplicate check (skip if force=True)
         if not force:
-            dup_result = check_duplicate(vec, owner_key, get_db_connection)
+            dup_result = check_duplicate(vec, owner_key, workspace, get_db_connection)
             if dup_result.is_duplicate:
-                merge_memory(dup_result.existing_id, owner_key, get_db_connection)
+                merge_memory(dup_result.existing_id, owner_key, workspace, get_db_connection)
                 logger.info(
                     f"DEBUG [MEMORY] Duplicata detectada (similarity={dup_result.similarity:.4f}). "
                     f"Merge realizado com memory_id={dup_result.existing_id}."
@@ -1131,7 +1132,7 @@ async def check_memory_duplicate(req: DuplicateCheckRequest, user: dict = Securi
     """Verifica se uma memória similar já existe antes de gravar."""
     owner_key = user["key"]
     vec = embed_model.encode([req.content])[0].tolist()
-    result = check_duplicate(vec, owner_key, get_db_connection)
+    result = check_duplicate(vec, owner_key, req.workspace, get_db_connection)
     return {
         "is_duplicate": result.is_duplicate,
         "existing_id": result.existing_id,
