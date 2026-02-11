@@ -413,8 +413,8 @@ def test_merge_memory_unit():
         check_params = list(check_sig.parameters.keys())
         merge_params = list(merge_sig.parameters.keys())
 
-        expected_check = ["embedding", "owner_key", "get_db_connection_func", "threshold"]
-        expected_merge = ["existing_id", "owner_key", "get_db_connection_func"]
+        expected_check = ["embedding", "owner_key", "workspace", "get_db_connection_func", "threshold"]
+        expected_merge = ["existing_id", "owner_key", "workspace", "get_db_connection_func"]
 
         for param in expected_check:
             if param not in check_params:

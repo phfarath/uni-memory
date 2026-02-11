@@ -32,7 +32,7 @@ class DuplicateCheckResult:
         }
 
 
-def check_duplicate(embedding: list, owner_key: str,
+def check_duplicate(embedding: list, owner_key: str, workspace: str,
                     get_db_connection_func, threshold: float = DEFAULT_SIMILARITY_THRESHOLD
                     ) -> DuplicateCheckResult:
     """
@@ -41,6 +41,7 @@ def check_duplicate(embedding: list, owner_key: str,
     Args:
         embedding: Vetor de embedding já calculado (384-dim)
         owner_key: Chave do dono (multi-tenancy filter)
+        workspace: Workspace para escopo correto de duplicatas
         get_db_connection_func: Função para obter conexão com DB
         threshold: Limiar de similaridade (default: 0.95)
 
@@ -49,7 +50,7 @@ def check_duplicate(embedding: list, owner_key: str,
 
     Algorithm:
         1. Busca a memória mais similar via pgvector cosine distance
-        2. Filtra por owner_key (multi-tenancy)
+        2. Filtra por owner_key + workspace (multi-tenancy + workspace scoping)
         3. Converte distance para similarity (1 - distance)
         4. Retorna duplicate=True se similarity >= threshold
 
@@ -68,10 +69,10 @@ def check_duplicate(embedding: list, owner_key: str,
         c.execute("""
             SELECT id, content, (embedding <=> %s::vector) as distance
             FROM memories
-            WHERE owner_key = %s
+            WHERE owner_key = %s AND workspace = %s
             ORDER BY distance ASC
             LIMIT 1
-        """, (embedding, owner_key))
+        """, (embedding, owner_key, workspace))
 
         result = c.fetchone()
         conn.close()
@@ -86,7 +87,7 @@ def check_duplicate(embedding: list, owner_key: str,
             logger.info(
                 f"[DUPLICATE] Detected: similarity={similarity:.4f} "
                 f"(threshold={threshold}) | memory_id={existing_id} | "
-                f"owner={owner_key[:20]}..."
+                f"owner={owner_key[:20]}... | workspace={workspace}"
             )
             return DuplicateCheckResult(
                 is_duplicate=True,
@@ -103,7 +104,7 @@ def check_duplicate(embedding: list, owner_key: str,
         return DuplicateCheckResult(is_duplicate=False)
 
 
-def merge_memory(existing_id: int, owner_key: str, get_db_connection_func) -> bool:
+def merge_memory(existing_id: int, owner_key: str, workspace: str, get_db_connection_func) -> bool:
     """
     Atualiza o timestamp de uma memória existente (merge strategy).
 
@@ -113,6 +114,7 @@ def merge_memory(existing_id: int, owner_key: str, get_db_connection_func) -> bo
     Args:
         existing_id: ID da memória existente
         owner_key: Chave do dono (verificação de ownership)
+        workspace: Workspace da memória a ser mesclada
         get_db_connection_func: Função para obter conexão com DB
 
     Returns:
@@ -122,8 +124,8 @@ def merge_memory(existing_id: int, owner_key: str, get_db_connection_func) -> bo
         conn = get_db_connection_func()
         c = conn.cursor()
         c.execute(
-            "UPDATE memories SET timestamp = %s WHERE id = %s AND owner_key = %s",
-            (time.time(), existing_id, owner_key)
+            "UPDATE memories SET timestamp = %s WHERE id = %s AND owner_key = %s AND workspace = %s",
+            (time.time(), existing_id, owner_key, workspace)
         )
         updated = c.rowcount
         conn.commit()
