@@ -26,6 +26,7 @@ from sentence_transformers import SentenceTransformer
 from mcp.server.fastmcp import FastMCP
 from app.rate_limiter import RateLimiter, ENDPOINT_ACTIONS, ACTION_REQUEST, cleanup_old_logs
 from app.auto_capture import auto_capture_engine, process_pending_events, cleanup_old_auto_capture_events
+from app.duplicate_prevention import check_duplicate, merge_memory
 
 # --- CONFIGURAÇÃO ---
 # A URL deve vir do .env: postgres://user:pass@endpoint.neon.tech/dbname?sslmode=require
@@ -76,6 +77,11 @@ class KeyRequest(BaseModel):
     owner_name: str
     tier: str = "free"
 
+class DuplicateCheckRequest(BaseModel):
+    content: str
+    session_id: str = "default"
+    workspace: str = "default"
+
 class AutoCaptureToggle(BaseModel):
     session_id: str
 
@@ -109,6 +115,9 @@ def init_db():
         # 2b. Indexes for multi-tenancy
         c.execute("CREATE INDEX IF NOT EXISTS idx_memories_owner ON memories(owner_key)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_memories_workspace ON memories(owner_key, workspace)")
+
+        # 2c. Vector similarity index for duplicate detection (HNSW)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_memories_embedding_hnsw ON memories USING hnsw (embedding vector_cosine_ops)")
         
         # 3. Tabela de Autenticação
         c.execute('''CREATE TABLE IF NOT EXISTS api_keys (
@@ -364,20 +373,33 @@ app.add_middleware(McpAuthMiddleware)
 
 # --- CORE LÓGICO COMPARTILHADO ---
 
-def add_memory_trace_logic(owner_key: str, session_id: str, role: str, content: str, workspace: str = "default"):
-    """Função síncrona/lógica pura para persistência. Inclui owner_key para multi-tenancy."""
+def add_memory_trace_logic(owner_key: str, session_id: str, role: str, content: str, workspace: str = "default", force: bool = False):
+    """Função síncrona/lógica pura para persistência. Inclui owner_key para multi-tenancy e prevenção de duplicatas."""
     try:
-        # Vetorização
-        vec = embed_model.encode([content])[0].tolist() 
-        
+        # Vetorização (calculado uma vez, reutilizado para check + insert)
+        vec = embed_model.encode([content])[0].tolist()
+
+        # Duplicate check (skip if force=True)
+        if not force:
+            dup_result = check_duplicate(vec, owner_key, workspace, get_db_connection)
+            if dup_result.is_duplicate:
+                merge_memory(dup_result.existing_id, owner_key, workspace, get_db_connection)
+                logger.info(
+                    f"DEBUG [MEMORY] Duplicata detectada (similarity={dup_result.similarity:.4f}). "
+                    f"Merge realizado com memory_id={dup_result.existing_id}."
+                )
+                return {"action": "merged", "existing_id": dup_result.existing_id,
+                        "similarity": dup_result.similarity}
+
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute("""INSERT INTO memories (owner_key, workspace, session_id, role, content, timestamp, embedding) 
+        c.execute("""INSERT INTO memories (owner_key, workspace, session_id, role, content, timestamp, embedding)
                      VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                   (owner_key, workspace, session_id, role, content, time.time(), vec))
         conn.commit()
         conn.close()
         logger.info(f"DEBUG [MEMORY] Trace persistido para owner {owner_key[:20]}...")
+        return {"action": "created"}
     except Exception as e:
         logger.error(f"CRITICAL [MEMORY] Falha ao gravar no Postgres: {e}")
         raise e
@@ -460,12 +482,13 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="remember",
-            description="Grava uma informação importante, fato, trecho de código ou preferência na memória de longo prazo.",
+            description="Grava uma informação importante na memória de longo prazo. Detecta duplicatas automaticamente.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "fact": {"type": "string", "description": "O conteúdo exato a ser lembrado."},
-                    "category": {"type": "string", "description": "Tag para organização (ex: 'work', 'code'). Default: 'general'"}
+                    "category": {"type": "string", "description": "Tag para organização (ex: 'work', 'code'). Default: 'general'"},
+                    "force": {"type": "boolean", "description": "Se true, grava mesmo que duplicata exista. Default: false"}
                 },
                 "required": ["fact"]
             }
@@ -562,9 +585,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         fact = arguments.get("fact")
         category = arguments.get("category", "general")
         workspace = arguments.get("workspace", "default")
+        force = arguments.get("force", False)
         try:
             enriched = f"[{category.upper()}] {fact}"
-            add_memory_trace_logic(owner_key, "mcp-session", "user", enriched, workspace)
+            result = add_memory_trace_logic(owner_key, "mcp-session", "user", enriched, workspace, force=force)
+
+            if result and result.get("action") == "merged":
+                return [TextContent(
+                    type="text",
+                    text=f"Memória similar já existe (similaridade: {result['similarity']:.1%}). "
+                         f"Timestamp atualizado na memória existente (ID: {result['existing_id']}). "
+                         f"Use force=true para gravar mesmo assim."
+                )]
+
             return [TextContent(type="text", text="Memória salva com sucesso na Nuvem Aethera.")]
         except Exception as e:
             return [TextContent(type="text", text=f"Erro interno: {e}")]
@@ -1093,6 +1126,19 @@ async def update_memory(memory_id: int, update: MemoryUpdate, user: dict = Secur
     conn.close()
     if updated == 0: raise HTTPException(404, "Not found")
     return {"status": "updated"}
+
+@app.post("/v1/memories/check-duplicate", tags=["Core"])
+async def check_memory_duplicate(req: DuplicateCheckRequest, user: dict = Security(verify_api_key)):
+    """Verifica se uma memória similar já existe antes de gravar."""
+    owner_key = user["key"]
+    vec = embed_model.encode([req.content])[0].tolist()
+    result = check_duplicate(vec, owner_key, req.workspace, get_db_connection)
+    return {
+        "is_duplicate": result.is_duplicate,
+        "existing_id": result.existing_id,
+        "existing_content": result.existing_content,
+        "similarity": round(result.similarity, 4) if result.similarity > 0 else 0
+    }
 
 # --- USAGE & TIER MANAGEMENT ENDPOINTS ---
 
