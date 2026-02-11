@@ -30,6 +30,8 @@ ENDPOINT_ACTIONS: Dict[str, Tuple[str, int]] = {
     "POST /v1/auto-capture/disable": (ACTION_AUTO_CAPTURE, 1),
     "POST /v1/auto-capture/event": (ACTION_AUTO_CAPTURE, 1),
     "GET /v1/auto-capture/status": (ACTION_REQUEST, 1),
+    # Duplicate Prevention Endpoints
+    "POST /v1/memories/check-duplicate": (ACTION_EMBEDDING, 1),
     # MCP Endpoints
     "POST /mcp": (ACTION_REQUEST, 1),
     "POST /mcp/messages": (ACTION_REQUEST, 1),

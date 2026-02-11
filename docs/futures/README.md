@@ -14,7 +14,7 @@
 | 001 | [Auto-Capture Context](001_v1.0_auto_capture.md) | ⏳ Pendente | — | 80h |
 | 002 | [Knowledge Graph](002_v1.0_knowledge_graph.md) | ⏳ Pendente | — | 120h |
 | 004 | [Smart Memory Triggers](004_v1.0_smart_triggers.md) | ⏳ Pendente | — | 40h |
-| 005 | [Duplicate Prevention](005_v1.0_duplicate_prevention.md) | ⏳ Pendente | — | 20h |
+| 005 | [Duplicate Prevention](005_v1.0_duplicate_prevention.md) | ✅ Completo | Claude | 20h |
 
 ### V1.1 - Advanced Features
 
