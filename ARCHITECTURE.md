@@ -555,6 +555,54 @@ python teste-de-validacao/attack.py
 
 ---
 
+## Future Architecture Documents
+
+A comprehensive 12-month roadmap for evolving Aethera Cortex from an AI Memory Platform into an **AI Memory + Reasoning Platform** with cognitive capabilities.
+
+### 📖 Documentation Location
+
+See [`docs/futures/`](./docs/futures/README.md) for detailed technical specifications.
+
+### 🎯 Key Future Features
+
+1. **[Reasoning-as-a-Service](./docs/futures/001_reasoning_as_a_service.md)** (Weeks 1-4)
+   - InftyThink+ inspired reasoning loops
+   - Solve complex, multi-step problems without context limits
+   - Automatic memory management
+   - **Status**: ✅ Ready for implementation
+
+2. **[Structured Protocol Levels](./docs/futures/002_structured_protocol_levels.md)** (Weeks 5-8)
+   - 3-level memory operations (Quick/Moderate/Complex)
+   - 40%+ cost savings via automatic routing
+   - **Status**: 📝 Proposal (depends on #1)
+
+3. **[Proactive Memory](./docs/futures/003_proactive_memory.md)** (Weeks 9-16)
+   - Memory that interrupts with failure pattern suggestions
+   - "⚠️ Approach X failed 3 times, try Y instead"
+   - **Status**: 📝 Proposal (depends on #1)
+
+4. **[Knowledge Graph](./docs/futures/004_knowledge_graph.md)** (Weeks 17-28)
+   - Semantic relationships (IMPLIES, CONTRADICTS, PREREQUISITE)
+   - Temporal reasoning and contradiction detection
+   - **Status**: 📝 Proposal (long term)
+
+5. **[Hybrid Memory Agent](./docs/futures/005_hybrid_memory_agent.md)** (Weeks 29-52)
+   - Small LLM + specialized modules + orchestrator
+   - Strategic synthesis, not just retrieval
+   - **Status**: 📝 Proposal (advanced)
+
+### 🗺️ Full Roadmap
+
+See **[docs/futures/006_implementation_roadmap.md](./docs/futures/006_implementation_roadmap.md)** for:
+- 12-month implementation timeline
+- Success metrics (technical, business, UX)
+- Pricing evolution
+- Risk mitigation strategies
+
+**Vision**: Transform from "passive memory storage" → "active cognitive partner"
+
+---
+
 ## Links Úteis
 
 - **MCP Specification**: https://spec.modelcontextprotocol.io
@@ -562,7 +610,9 @@ python teste-de-validacao/attack.py
 - **Neon PostgreSQL**: https://neon.tech
 - **FastAPI Docs**: https://fastapi.tiangolo.com
 - **SentenceTransformers**: https://www.sbert.net
+- **Future Architectures**: [docs/futures/README.md](./docs/futures/README.md)
 
 ---
 
 _Documentação gerada em 2026-01-21 | Aethera Cortex v2.1_
+_Future architecture roadmap added: 2026-02-13_
